@@ -1,56 +1,16 @@
 """Prepare GUDHI/TCGA data and run separate Autoencodix Varix trainings."""
 import argparse
-import contextlib
 import json
 import math
 import os
+
 # deterministic cuBLAS on the GPU (required by torch for reproducible runs; set before CUDA starts)
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 from pathlib import Path
 from typing import get_args
 
-
-ROOT = Path(__file__).resolve().parents[2]
-
-def _merge(base, override):
-    out = dict(base)
-    for key, value in override.items():
-        out[key] = _merge(base[key], value) if isinstance(value, dict) and isinstance(base.get(key), dict) else value
-    return out
-
-
-def load_settings(path, preset=None):
-    """Read editable training settings before loading datasets.
-
-    The single config file configs/varix.json holds named presets; select one with
-    ``preset=`` or as ``configs/varix.json#<preset>``. A preset overrides only the
-    values it lists (deep merge, lists replaced); keys starting with '_' are notes.
-    """
-    path = str(path)
-    if '#' in path:
-        path, preset = path.split('#', 1)
-    settings = json.loads(Path(path).read_text())
-    if not isinstance(settings, dict):
-        raise ValueError("Settings must be a JSON object")
-    presets = settings.pop("presets", {})
-    settings.pop("status", None)          # run status (output of src/experiments/run_status.py), never an input
-    if preset is not None:
-        if preset not in presets:
-            raise ValueError(f"Unknown preset {preset!r}; choose from {sorted(presets)}")
-        settings = _merge(settings, {k: v for k, v in presets[preset].items() if not k.startswith("_")})
-    unknown = set(settings) - {"dataset", "group", "skip_evaluation", "target", "training", "datasets",
-                               "collapse_monitor", "experiment", "robustness", "guard", "protocol", "data", "runs"}
-    if unknown:
-        raise ValueError(f"Unknown settings: {sorted(unknown)}")
-    if settings.get("dataset", "both") not in ("tcga", "gudhi", "both"):
-        raise ValueError("dataset must be tcga, gudhi or both")
-    for name in ("training", "datasets"):
-        if not isinstance(settings.get(name, {}), dict):
-            raise ValueError(f"{name} must be an object")
-    for name, values in settings.get("datasets", {}).items():
-        if name not in ("tcga", "gudhi") or not isinstance(values, dict):
-            raise ValueError("datasets must map tcga/gudhi to parameter objects")
-    return settings
+from .load_config import ROOT, load_config
+from .load_data import variance_order
 
 
 def main():
@@ -67,16 +27,16 @@ def main():
     parser.add_argument("--skip-evaluation", action="store_true", default=None)
     parser.add_argument("--target")
     from .load_data import GROUPS, feature_order, synthetic, tcga
-    parser.add_argument("--group", choices=sorted(GROUPS), help="TCGA sample group (default: config, else all_classes)")
+    parser.add_argument("--group", choices=sorted(GROUPS), help="TCGA sample group (default: first of experiment.groups in the config)")
     args = parser.parse_args()
-    settings = load_settings(args.config)
+    settings = load_config(args.config)
     selected = args.dataset or settings.get("dataset", "both")
     common = settings.get("training", {})
     overrides = {key: value for key, value in {
         "epochs": args.epochs, "batch_size": args.batch_size,
         "beta": args.beta, "anneal_function": args.anneal,
     }.items() if value is not None}
-    group = args.group or settings.get("group", "all_classes")
+    group = args.group or settings.get("experiment", {}).get("groups", ["all_classes"])[0]
     if group not in GROUPS:
         raise ValueError(f"group must be one of {sorted(GROUPS)}")
     for name in (["gudhi", "tcga"] if selected == "both" else [selected]):
@@ -107,7 +67,7 @@ def drop_checkpoint_reconstructions(result):
     Autoencodix reads, are kept. mu, logvar and z of every checkpoint stay.
     """
     data = result.reconstructions._data
-    for epoch in [e for e in data if e != -1]:
+    for epoch in [epoch for epoch in data if epoch != -1]:
         del data[epoch]
 
 
@@ -130,41 +90,6 @@ def save_latents(result, path):
         frame.insert(0, "split", split)
         frames.append(frame)
     pd.concat(frames, ignore_index=True).to_parquet(path, index=False)
-
-
-@contextlib.contextmanager
-def variance_order(order="top"):
-    """Within the block, AUTOENCODIX's VAR filter keeps the k lowest-variance features.
-
-    ``order="top"`` changes nothing (AUTOENCODIX: k highest variance). ``"low"``
-    replaces DataFilter._filter_by_variance by the ascending ranking; zero-variance
-    features are still removed before (AUTOENCODIX does that first). Yields a list
-    that records the k of every call, so the caller can check the filter ran.
-    """
-    if order not in ("top", "low"):
-        raise ValueError("feature_order must be 'top' or 'low'")
-    calls = []
-    if order == "top":
-        yield calls
-        return
-    import numpy as np
-    import pandas as pd
-    from autoencodix.data._filter import DataFilter
-
-    original = DataFilter._filter_by_variance
-
-    def lowest(self, df, k):
-        if k is None or k > df.shape[1]:
-            return original(self, df, k)
-        calls.append(k)
-        var = pd.Series(np.var(df, axis=0), index=df.columns)
-        return df[var.sort_values(ascending=True, kind="stable").index[:k]]
-
-    DataFilter._filter_by_variance = lowest
-    try:
-        yield calls
-    finally:
-        DataFilter._filter_by_variance = original
 
 
 def train_varix(modalities, annotation=None, *, dataset="tcga", epochs=30,
@@ -253,8 +178,9 @@ def train_varix(modalities, annotation=None, *, dataset="tcga", epochs=30,
             raise ValueError("guard.collapse_value must be finite and positive")
         if "band" in guard:
             guard["band"] = tuple(guard["band"])
-        from src.core.guarded_trainer import GuardedTrainer
         from functools import partial
+
+        from src.core.guarded_trainer import GuardedTrainer
         history = output / "collapse_history.jsonl"
         if history.exists():
             raise FileExistsError(f"Use a fresh output_dir to preserve existing history: {history}")

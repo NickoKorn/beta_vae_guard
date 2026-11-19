@@ -1,9 +1,9 @@
 """Generate GUDHI data or load, align and subset the AUTOENCODIX TCGA data (Zenodo).
 
 TCGA source: AUTOENCODIX reproducibility archive, doi:10.5281/zenodo.15518831.
-Only the three needed parquet members are fetched with HTTP range requests and
-verified against the archive CRC/size (logic from vae-beta-control
-``datasets/fetch_tcga_pancancer.py``). Existing files in ``data/tcga`` are used.
+The three parquet files must already be in ``data/tcga``: download them once with
+``python -m src.core.fetch_tcga`` (byte-range fetch, CRC and SHA-256 checks). Loading
+never downloads; it only checks that the files exist with the right size.
 
 Groups (configs/varix.json -> data.tcga.groups, sources in group_sources) select
 samples only. Feature filtering (k_filter) and scaling are left to AUTOENCODIX,
@@ -12,30 +12,23 @@ which fits them on the training split of whatever samples it receives;
 Labels are never an estimator or model input.
 """
 import argparse
-import json
-import shutil
-import struct
-import time
-import zlib
-from collections.abc import Iterable, Mapping
+import contextlib
 from pathlib import Path
-from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[2]
-CONFIG = ROOT / "configs" / "varix.json"
+from .load_config import CONFIG, ROOT, load_config
+
 # Data location, origin and groups come from the single config (section "data").
-_DATA = json.loads(CONFIG.read_text())["data"]
+_DATA = load_config(CONFIG)["data"]
 _TCGA = _DATA["tcga"]
 TCGA_DIR = ROOT / _TCGA["root"]
 
-LABEL = _TCGA["label"]
-DETAIL = _TCGA["detail"]
+LABEL = _TCGA["label"]            # CANCER_TYPE_ACRONYM: selects the groups and is the class target
+DETAIL = _TCGA["detail"]          # CANCER_TYPE_DETAILED: stays in the returned annotation for analyses
 
-# Spec: acronym -> None (whole class) or list of allowed CANCER_TYPE_DETAILED values.
-# None as a whole means Pan-Cancer. A plain list of acronyms is accepted as shorthand.
+# Group -> None (Pan-Cancer, all samples) or a list of CANCER_TYPE_ACRONYM values.
 # Sources per group: configs/varix.json -> data.tcga.group_sources.
 GROUPS = {name: (None if spec is None else list(spec)) for name, spec in _TCGA["groups"].items()}
 
@@ -44,14 +37,45 @@ GROUPS = {name: (None if spec is None else list(spec)) for name, spec in _TCGA["
 # (per modality, RNA and METH; still fitted on the training split only).
 LOW_VARIANCE = _TCGA["lowvar_suffix"]
 GROUPS.update({name + LOW_VARIANCE: spec for name, spec in list(GROUPS.items())})
-
+ZENODO = _TCGA["source"]
 
 def feature_order(group):
     """'low' for a *_lowvar group (lowest-variance features), else 'top' (AUTOENCODIX default)."""
     return "low" if str(group).endswith(LOW_VARIANCE) else "top"
 
+@contextlib.contextmanager
+def variance_order(order="top"):
+    """Within the block, AUTOENCODIX's VAR filter keeps the k lowest-variance features.
 
-ZENODO = _TCGA["source"]
+    ``order="top"`` changes nothing (AUTOENCODIX: k highest variance). ``"low"``
+    replaces DataFilter._filter_by_variance by the ascending ranking; zero-variance
+    features are still removed before (AUTOENCODIX does that first). Yields a list
+    that records the k of every call, so the caller can check the filter ran.
+    """
+    if order not in ("top", "low"):
+        raise ValueError("feature_order must be 'top' or 'low'")
+    calls = []
+    if order == "top":
+        yield calls
+        return
+    import numpy as np
+    import pandas as pd
+    from autoencodix.data._filter import DataFilter
+
+    original = DataFilter._filter_by_variance
+
+    def lowest(self, df, k):
+        if k is None or k > df.shape[1]:
+            return original(self, df, k)
+        calls.append(k)
+        var = pd.Series(np.var(df, axis=0), index=df.columns)
+        return df[var.sort_values(ascending=True, kind="stable").index[:k]]
+
+    DataFilter._filter_by_variance = lowest
+    try:
+        yield calls
+    finally:
+        DataFilter._filter_by_variance = original
 
 
 def synthetic():
@@ -73,114 +97,36 @@ def synthetic():
     return {"sphere": frame}, None
 
 
-def _fetch_member(member, destination):
-    """Download one ZIP member by byte range, inflate it and verify CRC/size."""
-    target = destination / member["name"]
-    cache = destination / ".download"
-    cache.mkdir(parents=True, exist_ok=True)
-    partial = cache / (member["name"] + ".zipmember")
-    total = member["end_offset"] - member["offset"] + 1
-    if shutil.disk_usage(destination).free < member["size"] + total + 256 * 1024**2:
-        raise OSError(f"Insufficient disk space for {member['name']}")
-    retries = 0
-    while not partial.exists() or partial.stat().st_size < total:
-        have = partial.stat().st_size if partial.exists() else 0
-        start = member["offset"] + have
-        end = min(member["end_offset"], start + 16 * 1024 * 1024 - 1)
-        request = Request(ZENODO["url"], headers={"Range": f"bytes={start}-{end}",
-                                                  "User-Agent": "tcga-loader/1"})
-        try:
-            with urlopen(request, timeout=60) as response:
-                if response.status != 206 or not response.headers.get("Content-Range", "").startswith(f"bytes {start}-"):
-                    raise ValueError("Server did not honour the requested byte range")
-                with partial.open("ab") as output:
-                    remaining = end - start + 1
-                    while remaining:
-                        block = response.read(min(1024 * 1024, remaining))
-                        if not block:
-                            raise OSError("Incomplete range response")
-                        output.write(block)
-                        remaining -= len(block)
-            retries = 0
-            print(f"{member['name']}: {partial.stat().st_size / total:.1%}", flush=True)
-        except (OSError, TimeoutError) as error:
-            retries += 1
-            print(f"Keeping partial download after {error}; retry {retries}", flush=True)
-            if retries > 10:
-                raise
-            time.sleep(min(30, retries * 3))
-    temporary = target.with_suffix(".tmp")
-    with partial.open("rb") as stream, temporary.open("wb") as output:
-        header = struct.unpack("<4s5H3I2H", stream.read(30))
-        if header[0] != b"PK\x03\x04" or header[3] != 8:
-            raise ValueError("Unexpected ZIP member header/compression")
-        stream.read(header[-2] + header[-1])
-        decoder = zlib.decompressobj(-15)
-        remaining, crc, size = member["compressed_size"], 0, 0
-        while remaining:
-            block = stream.read(min(256 * 1024, remaining))
-            if not block:
-                raise ValueError("Truncated ZIP member")
-            remaining -= len(block)
-            decoded = decoder.decompress(block)
-            output.write(decoded)
-            crc, size = zlib.crc32(decoded, crc), size + len(decoded)
-        decoded = decoder.flush()
-        output.write(decoded)
-        crc, size = zlib.crc32(decoded, crc), size + len(decoded)
-    if crc != member["crc"] or size != member["size"] or not decoder.eof:
-        temporary.unlink()
-        raise ValueError(f"CRC/size check failed for {member['name']}")
-    temporary.replace(target)
-    return target
-
-
 def tcga_files(folder=TCGA_DIR):
-    """Paths of the Zenodo parquet files; missing ones are downloaded and verified."""
+    """Paths of the three TCGA parquet files; they must exist with the size of the Zenodo archive."""
     folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    paths = {}
+    paths, problems = {}, []
     for key, member in ZENODO["members"].items():
         path = folder / member["name"]
         if not path.exists():
-            path = _fetch_member(member, folder)
+            problems.append(f"missing: {path}")
         elif path.stat().st_size != member["size"]:
-            raise ValueError(f"{path} has the wrong size; delete it to re-download")
+            problems.append(f"wrong size: {path} ({path.stat().st_size} != {member['size']} bytes)")
         paths[key] = path
-    (folder / "source.json").write_text(json.dumps(ZENODO, indent=2) + "\n")
+    if problems:
+        raise FileNotFoundError("TCGA data not ready (" + "; ".join(problems) + "). "
+                                "Download once with: python -m src.core.fetch_tcga")
     return paths
 
 
-def _normalise(spec):
-    if spec is None:
-        return None
-    if isinstance(spec, str):
-        return _normalise(GROUPS[spec]) if spec in GROUPS else {spec: None}
-    if isinstance(spec, Mapping):
-        return {str(k): (None if v is None else tuple(v)) for k, v in spec.items()}
-    if isinstance(spec, Iterable):
-        return {str(k): None for k in spec}
-    raise TypeError("group must be None, a GROUPS key, an acronym, a list or a dict")
-
-
 def select_samples(annotation, group=None):
-    """Sample IDs of a group in the given order; ``group`` may be a GROUPS key."""
-    rules = _normalise(group)
-    if rules is None:
+    """Sample IDs of a configured group (configs/varix.json -> data.tcga.groups), in the given order."""
+    if group is None:
         return annotation.index
-    unknown = set(rules) - set(annotation[LABEL].dropna())
+    if group not in GROUPS:
+        raise ValueError(f"Unknown group {group!r}; choose from {sorted(GROUPS)}")
+    acronyms = GROUPS[group]
+    if acronyms is None:                       # all_classes: Pan-Cancer
+        return annotation.index
+    unknown = set(acronyms) - set(annotation[LABEL].dropna())
     if unknown:
         raise ValueError(f"Unknown {LABEL} values: {sorted(unknown)}")
-    mask = pd.Series(False, index=annotation.index)
-    for acronym, details in rules.items():
-        hit = annotation[LABEL] == acronym
-        if details is not None:
-            missing = set(details) - set(annotation.loc[hit, DETAIL].dropna())
-            if missing:
-                raise ValueError(f"No {DETAIL} {sorted(missing)} within {acronym}")
-            hit &= annotation[DETAIL].isin(details)
-        mask |= hit
-    return annotation.index[mask.to_numpy()]
+    return annotation.index[annotation[LABEL].isin(acronyms).to_numpy()]
 
 
 def tcga(group=None, folder=TCGA_DIR):

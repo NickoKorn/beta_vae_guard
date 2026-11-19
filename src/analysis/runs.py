@@ -15,13 +15,13 @@ are no longer in robustness.factors get role "outside_grid".
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 
-from src.core.train_varix import ROOT
+from src.core.load_config import ROOT, config_name, load_config, training_configs
 
 CONFIG = ROOT / "configs" / "varix.json"
 COLUMNS = ["study", "role", "layout", "method", "branch", "config", "group", "split", "seed", "checkpoint",
@@ -35,15 +35,10 @@ def _read(path):
         return None
 
 
-def _level(value):
-    return format(value, "g") if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
-
-
 def grid_configs(config=None):
-    """Names of the configurations of the current robustness grid (base + one factor at a time)."""
-    config = config or json.loads(CONFIG.read_text())
-    base, factors = config["training"], config["robustness"]["factors"]
-    return {"base"} | {f"{f}{_level(v)}" for f, values in factors.items() for v in values if v != base[f]}
+    """Names of the configurations in the configured robustness design."""
+    config = config or load_config(CONFIG)
+    return {name for name, _ in training_configs(config)}
 
 
 def canonical_config(name, factors):
@@ -116,7 +111,7 @@ def _sweep(study_dir, protocol, factors):
         meta = _read(done.parent / "variant.json") or {}
         guard = meta.get("guard", {})
         training = guard.get("training") or {}
-        config = "base" if not training else "".join(f"{k}{_level(v)}" for k, v in training.items())
+        config = config_name(training, {})        # every listed parameter is a change ('base' if none)
         if guard.get("enabled") is False:
             method = "annealing"
         else:
@@ -139,6 +134,8 @@ def _generic(study_dir, protocol, factors):
                 continue
             seen.add(done.parent)
             rel = done.parent.relative_to(study_dir).parts
+            if rel and rel[0] == "grid" and not (done.parent / "run_complete.json").exists():
+                continue
             method = next((_method_from_branch(p) for p in reversed(rel)
                            if _method_from_branch(p) in ("early_stop", "controlvae", "freeze", "annealing",
                                                          "unguarded")), None)
@@ -149,6 +146,8 @@ def _generic(study_dir, protocol, factors):
                 method = "check"
             config = next((canonical_config(p, factors) for p in rel
                            if p == "base" or canonical_config(p, factors) != p), "base")
+            if rel and rel[0] == "grid":
+                config = rel[1]
             group = next((p for p in rel if p in ("all_classes", "ontix_standard", "weak_signal_lowvar",
                                                   "weak_signal")), None)
             split = next((int(p[5:]) for p in rel if p.startswith("split") and p[5:].isdigit()), None)
