@@ -87,7 +87,7 @@
   },
   "data": {
     "tcga": {
-      "root": "data/tcga",
+      "root": "src/core_real_final/data/tcga",
       "label": "CANCER_TYPE_ACRONYM",
       "groups": {
         "all_classes": null,

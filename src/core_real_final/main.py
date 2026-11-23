@@ -34,6 +34,7 @@ def main():
             # Windows: execv does not replace the process, so run a child and pass on its exit code
             sys.exit(subprocess.run(command).returncode)
         os.execv(sys.executable, command)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ssd_path", nargs="?", type=Path, default=Path("/mnt/data"),
                         help="SSD directory (default: /mnt/data)")
@@ -51,31 +52,23 @@ def main():
     parser.add_argument("--split-seed", type=int)
     parser.add_argument("--train-seed", type=int)
     parser.add_argument("--run-name")
-    # Lucas-monitored handover (protocol.lucas_handover in the config; flags override it)
     parser.add_argument("--lucas-handover", action=argparse.BooleanOptionalAction, default=None,
-                        help="enable the configured Lucas protocol (default: go back one healthy epoch on full collapse)")
-    parser.add_argument("--handover-k", type=float, help="handover level k in k*d*eps")
-    parser.add_argument("--setpoint-k", type=float, help="PI setpoint level k in k*d*eps (default: handover k)")
-    parser.add_argument("--handover-k-step", type=float, help="raise of both k per restart")
+                        help="enable the Lucas full-collapse rollback protocol (default from config)")
     parser.add_argument("--max-restarts", type=int)
     parser.add_argument("--control-epochs", type=int)
+    parser.add_argument("--control-steps", type=int,
+                        help="hold duration in training steps (overrides --control-epochs)")
+    parser.add_argument("--min-handover-epoch", type=int,
+                        help="warmup epochs before collapse can trigger handover or failure")
     parser.add_argument("--observe-collapse", action="store_true",
                         help="plain annealing without handover/PI/early stop; log epoch and beta of each "
                              "Lucas axis collapse and of the full collapse")
     parser.add_argument("--observe-until-end", action="store_true",
                         help="with --observe-collapse: keep training after the confirmed full collapse")
-    parser.add_argument("--trigger", choices=("rate", "lucas"),
-                        help="handover trigger: rate (R <= k*d*eps) or lucas (>= int(fraction*d) axes "
-                             "collapsed at --trigger-epsilon)")
-    parser.add_argument("--trigger-epsilon", type=float, help="epsilon of the lucas trigger (default 1.0)")
-    parser.add_argument("--trigger-fraction", type=float, help="share of axes for the lucas trigger (default 0.75)")
     parser.add_argument("--monitor-epsilons", help="comma-separated epsilons whose collapsed axes are "
                         "logged every epoch, e.g. 0.01,0.1,0.5,1")
     parser.add_argument("--collapse-epsilon", type=float,
-                        help="Lucas epsilon of the (hard) collapse boundary for restarts and full collapse "
-                             "(default: protocol.collapse.lucas_epsilon_nats); rate levels keep that value")
-    parser.add_argument("--control-steps", type=int,
-                        help="hold duration in training steps (overrides --control-epochs)")
+                        help="Lucas epsilon of the collapse boundary (default: protocol.collapse.lucas_epsilon_nats)")
     parser.add_argument("--print-lucas", action="store_true",
                         help="print the collapsed axes per monitored epsilon after every epoch")
     parser.add_argument("--kp", type=float, help="PI proportional gain (overrides guard.kp)")
@@ -127,6 +120,7 @@ def main():
                                     "--split-seed", str(split), "--train-seed", str(seed)], check=True)
         print(f"{count} runs")
         return
+
     if dataset not in ("tcga", "gudhi"):
         parser.error("This entry point runs one dataset at a time; choose --dataset tcga or gudhi")
     training = {**settings["training"], **settings.get("datasets", {}).get(dataset, {})}
@@ -136,32 +130,30 @@ def main():
             parser.error(f"Unknown variant for {dataset}: {args.variant}")
         training = variants[args.variant]
     training.setdefault("anneal_function", "logistic-mid")
+
     guard = dict(settings.get("guard", {}))
     for key, value in (("kp", args.kp), ("ki", args.ki)):
         if value is not None:
             guard[key] = value
     if args.beta_max is not None:
         guard["beta_max"] = args.beta_max if args.beta_max in ("trigger", "schedule") else float(args.beta_max)
+
     protocol = settings.get("protocol", {})
     collapse = protocol.get("collapse", {})
     lucas = dict(protocol.get("lucas_handover", {}))
     lucas.pop("description", None)
+    lucas.pop("single_threshold", None)
     configured_steps = lucas.pop("control_steps", None)
-    for key, value in (("enabled", args.lucas_handover), ("handover_k", args.handover_k),
-                       ("setpoint_k", args.setpoint_k), ("handover_k_step", args.handover_k_step),
-                       ("max_restarts", args.max_restarts), ("control_epochs", args.control_epochs),
-                       ("handover_trigger", args.trigger), ("trigger_epsilon", args.trigger_epsilon),
-                       ("trigger_fraction", args.trigger_fraction)):
+    for key, value in (("enabled", args.lucas_handover), ("max_restarts", args.max_restarts),
+                       ("control_epochs", args.control_epochs),
+                       ("min_handover_epoch", args.min_handover_epoch)):
         if value is not None:
             lucas[key] = value
-    if args.handover_k is not None and args.setpoint_k is None:
-        lucas["setpoint_k"] = args.handover_k   # setpoint follows a changed handover level unless given
     lucas_enabled = bool(lucas.pop("enabled", False)) and not args.observe_collapse
     if args.observe_until_end and not args.observe_collapse:
         parser.error("--observe-until-end requires --observe-collapse")
+
     mode = args.mode or guard.get("form", "controlvae")
-    # The Lucas handover feeds the PI with the training-batch total KL; a validation signal
-    # (e.g. guard.signal = valid_total) would let validation data steer training.
     signal = args.signal or ("total" if lucas_enabled or args.observe_collapse else guard.get("signal", "total"))
     if mode not in ("early_stop", "freeze", "controlvae"):
         parser.error("Set guard.form or --mode to early_stop, freeze or controlvae")
@@ -169,6 +161,8 @@ def main():
         parser.error("Set guard.signal or --signal to total or max for training KL feedback")
     if lucas_enabled and signal != "total":
         parser.error("--lucas-handover requires --signal total")
+    guard.update(form=mode, signal=signal)
+
     if dataset == "tcga":
         group = args.group or (experiment.get("groups") or ["all_classes"])[0]
         topology = None
@@ -177,22 +171,12 @@ def main():
             parser.error("--group applies only to TCGA")
         group = None
         topology = args.topology or (experiment.get("topologies") or ["sphere"])[0]
+
     seed = training.get("global_seed", 1)
     split_seed = args.split_seed if args.split_seed is not None else (experiment.get("split_seeds") or [seed])[0]
     train_seed = args.train_seed if args.train_seed is not None else (experiment.get("seeds") or [seed])[0]
-    handover_kl = float(guard.get("handover_kl", guard.get("control_value", 0.10)))
-    target_kl = float(guard.get("target_kl", 0.05))
-    guard.update(form=mode, signal=signal)
-    guard.setdefault("guard_observe_start_value", 2 * handover_kl)
     data_name = group if dataset == "tcga" else topology
-    if lucas_enabled and lucas.get("single_threshold", True):
-        lucas_tag = "-lucas-lookback"
-    elif lucas_enabled and lucas.get("handover_trigger", "rate") == "lucas":
-        lucas_tag = f"-lucastrig-e{lucas.get('trigger_epsilon', 1.0):g}-f{lucas.get('trigger_fraction', 0.75):g}"
-    elif lucas_enabled:
-        lucas_tag = f"-lucas-k{lucas.get('handover_k', 3):g}-sp{lucas.get('setpoint_k', lucas.get('handover_k', 3)):g}"
-    else:
-        lucas_tag = ""
+    lucas_tag = "-lucas-lookback" if lucas_enabled else ""
     monitor_epsilons = [float(e) for e in args.monitor_epsilons.split(",")] if args.monitor_epsilons else []
     mode_tag = "observe" if args.observe_collapse else mode
     variant_tag = f"-{args.variant}" if args.variant else ""
@@ -225,6 +209,9 @@ def main():
         if group not in valid_groups:
             parser.error(f"Unknown TCGA group {group!r}; choose from {sorted(valid_groups)}")
         data_root = ROOT / tcga_settings["root"]
+        from src.core_real_final.fetch_tcga import fetch_tcga
+
+        fetch_tcga(data_root, tcga_settings["source"])
         modalities, annotation = tcga(group, folder=data_root, tcga_config=tcga_settings)
         order = "low" if group.endswith(lowvar_suffix) else "top"
         feature_order_name = order
@@ -278,10 +265,8 @@ def main():
         config=config, model_type=VarixArchitecture, loss_type=VarixLoss,
         collapse_output=output, collapse_threshold=float(guard.get("collapse_value", 0.01)),
         guard_enabled=guard.get("enabled", True), guard_options=guard,
-        handover_kl=handover_kl, target_kl=target_kl,
         lucas_epsilon=(args.collapse_epsilon if args.collapse_epsilon is not None
                        else float(collapse.get("lucas_epsilon_nats", 0.01))),
-        rate_epsilon=float(collapse.get("lucas_epsilon_nats", 0.01)),
         control_steps=args.control_steps if args.control_steps is not None else configured_steps,
         lucas_delta=float(collapse.get("lucas_delta", 0.01)),
         lucas_confirm_epochs=int(collapse.get("lucas_confirm_epochs", 3)),
@@ -290,13 +275,10 @@ def main():
         observe_until_end=args.observe_until_end,
         monitor_epsilons=monitor_epsilons,
         on_epoch=print_lucas if args.print_lucas else None,
-        # level checkpoints next to the run on the SSD; unused ones are deleted after training
         handover_checkpoint_dir=output / "handover_levels",
         **lucas,
     )
-    # with the Lucas handover the level checkpoints replace the single handover.pt
-    trainer.train(handover_checkpoint=None if lucas_enabled else output / "handover.pt",
-                  export_posteriors=protocol.get("export_posteriors", False))
+    trainer.train(export_posteriors=protocol.get("export_posteriors", False))
     if lucas_enabled:
         # Report only, after training: Lucas on the untouched test split (no influence on training).
         summary_path = output / "guard_summary.json"

@@ -58,7 +58,9 @@ def collect_results(root):
             "lucas_noncollapsed_dimensions_at_collapse": (
                 collapse.get("lucas_n_noncollapsed_train_eval") if collapse else None
             ),
-            "beta_pi_start": start_factor * scale if start_factor is not None and scale is not None else None,
+            "beta_pi_start": (protocol.get("beta_handover_effective")
+                              if protocol.get("beta_handover_effective") is not None else
+                              (start_factor * scale if start_factor is not None and scale is not None else None)),
             "beta_stable": last.get("beta_batch_last", last.get("effective_beta")) if success and last else None,
             "kl_train_total_at_stable": last.get("R_train_nats") if success and last else None,
             "kl_eval_total_at_stable": last.get("R_train_eval_nats") if success and last else None,
@@ -76,6 +78,7 @@ def collect_results(root):
             "beta_pi_epoch_min": last.get("beta_batch_min") if success and last else None,
             "beta_pi_epoch_max": last.get("beta_batch_max") if success and last else None,
             "restarts": attempt,
+            "kl_in_target_band_share": protocol.get("kl_in_target_band_share") if success else None,
             "control_epochs_requested": protocol.get("control_epochs") if protocol.get("control_steps") is None else None,
             "control_steps_requested": protocol.get("control_steps"),
             "status": "stabilized" if success else (protocol.get("fail_reason") or protocol.get("phase") or "unknown"),

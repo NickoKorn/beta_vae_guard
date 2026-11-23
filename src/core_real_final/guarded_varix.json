@@ -60,10 +60,10 @@
     "enabled": true,
     "form": "controlvae",
     "kp": 0.002,
-    "ki": 0.16,
-    "gains_per": "epoch",
+    "ki": 0.001,
+    "gains_per": "step",
     "beta_min": 0.0,
-    "beta_max": "trigger",
+    "beta_max": "schedule",
     "anti_windup": "conditional",
     "signal": "total"
   },
@@ -75,19 +75,19 @@
     },
     "lucas_handover": {
       "enabled": true,
-      "single_threshold": true,
-      "max_restarts": 3,
-      "ring_buffer_size": 4,
+      "max_restarts": 15,
+      "ring_buffer_size": 20,
+      "min_handover_epoch": 5,
       "collapse_eval_batch_size": 2048,
-      "description": "Bei vollem Lucas-Kollaps den letzten gesunden Checkpoint laden. PI regelt dessen mittlere Trainings-Gesamt-KL 50 vollständige Epochen lang. Bei erneutem Kollaps einen Checkpoint weiter zurückgehen.",
-      "control_steps": null,
-      "control_epochs": 50,
+      "description": "Bei vollem Lucas-Kollaps (ab min_handover_epoch) den letzten gesunden Checkpoint laden. ControlVAE-PI regelt dessen mittlere Trainings-Gesamt-KL 1000 Trainingsschritte lang. Bei erneutem Kollaps einen Checkpoint weiter zurückgehen.",
+      "control_steps": 1000,
+      "control_epochs": 100,
       "beta_final_window": 20
     }
   },
   "data": {
     "tcga": {
-      "root": "data/tcga",
+      "root": "src/core_real_final/data/tcga",
       "label": "CANCER_TYPE_ACRONYM",
       "groups": {
         "all_classes": null,

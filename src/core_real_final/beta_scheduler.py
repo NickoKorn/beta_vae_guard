@@ -44,7 +44,7 @@ class BetaScheduler:
             epoch_current=epoch_current, total_epoch=self.total_epochs, func=self.schedule,
         )
 
-    def start(self, mode, beta, *, measured_kl=None, target_kl=None, kp=None, ki_epoch=None):
+    def start(self, mode, beta, *, measured_kl=None, target_kl=None):
         """Freeze beta or initialize PI at the current beta."""
         if mode not in ("freeze", "controlvae"):
             raise ValueError("mode must be 'freeze' or 'controlvae'")
@@ -53,11 +53,6 @@ class BetaScheduler:
                 raise ValueError("ControlVAE needs a positive finite KL target")
             if measured_kl is None or not math.isfinite(measured_kl):
                 raise ValueError("ControlVAE needs a finite KL measurement")
-            if kp is not None:
-                self.kp = kp
-            if ki_epoch is not None:
-                self.ki, self.gains_per = ki_epoch, "step"
-                self.ki_step = ki_epoch / self.batches_per_epoch
             self.target_kl = target_kl
             error = target_kl - measured_kl
             self.integral = beta - proportional_term(error, self.kp) - self.beta_min
