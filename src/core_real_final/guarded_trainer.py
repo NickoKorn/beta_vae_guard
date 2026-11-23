@@ -760,7 +760,7 @@ class GuardedTrainer(GeneralTrainer):
 
     def _export_posteriors(self, epoch, beta, *, event="checkpoint", attempt=0):
         """Export the posteriors and reconstruction scores used by the analyses."""
-        from ..analysis.latent import reconstruction_r2
+        from .reconstruction import reconstruction_r2
 
         path = Path("posteriors") / f"epoch{epoch + 1}_{event}_attempt{attempt}.npz"
         (self.collapse_output / path).parent.mkdir(parents=True, exist_ok=True)

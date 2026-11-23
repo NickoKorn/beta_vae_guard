@@ -1,0 +1,178 @@
+{
+  "dataset": "tcga",
+  "experiment": {
+    "seeds": [
+      1,
+      2,
+      3
+    ],
+    "split_seeds": [
+      1,
+      2,
+      3
+    ],
+    "groups": [
+      "all_classes",
+      "ontix_standard",
+      "weak_signal_lowvar"
+    ],
+    "topologies": [
+      "sphere",
+      "circle"
+    ]
+  },
+  "training": {
+    "epochs": 1000,
+    "checkpoint_interval": 100,
+    "batch_size": 256,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.001,
+    "drop_p": 0.1,
+    "latent_dim": 8,
+    "n_layers": 2,
+    "enc_factor": 4,
+    "beta": 1.0,
+    "anneal_function": "logistic-mid",
+    "reconstruction_loss": "mse",
+    "default_vae_loss": "kl",
+    "loss_reduction": "mean",
+    "scaling": "MINMAX",
+    "train_ratio": 0.6,
+    "valid_ratio": 0.2,
+    "test_ratio": 0.2,
+    "device": "cuda",
+    "n_gpus": 1,
+    "float_precision": "32",
+    "compile_model": false,
+    "pin_memory": false,
+    "reproducible": true,
+    "global_seed": 2
+  },
+  "datasets": {
+    "tcga": {
+      "k_filter": 2000
+    },
+    "gudhi": {
+      "latent_dim": 3
+    }
+  },
+  "guard": {
+    "enabled": true,
+    "form": "controlvae",
+    "kp": 0.002,
+    "ki": 0.06,
+    "gains_per": "step",
+    "beta_min": 0.0,
+    "beta_max": "trigger",
+    "anti_windup": "conditional",
+    "signal": "total"
+  },
+  "protocol": {
+    "export_posteriors": true,
+    "collapse": {
+      "lucas_epsilon_nats": 0.2,
+      "lucas_delta": 0.01
+    },
+    "lucas_handover": {
+      "enabled": true,
+      "single_threshold": true,
+      "max_restarts": 15,
+      "ring_buffer_size": 30,
+      "collapse_eval_batch_size": 2048,
+      "description": "Bei vollem Lucas-Kollaps den letzten gesunden Checkpoint laden. PI regelt dessen mittlere Trainings-Gesamt-KL 50 vollständige Epochen lang. Bei erneutem Kollaps einen Checkpoint weiter zurückgehen.",
+      "control_steps": null,
+      "control_epochs": 100,
+      "beta_final_window": 20
+    }
+  },
+  "data": {
+    "tcga": {
+      "root": "data/tcga",
+      "label": "CANCER_TYPE_ACRONYM",
+      "groups": {
+        "all_classes": null,
+        "ontix_standard": [
+          "BRCA",
+          "OV",
+          "LUAD",
+          "UCEC",
+          "LUSC",
+          "COAD",
+          "READ",
+          "UCS"
+        ],
+        "weak_signal": [
+          "COAD",
+          "READ"
+        ]
+      },
+      "lowvar_suffix": "_lowvar",
+      "source": {
+        "doi": "10.5281/zenodo.15518831",
+        "members": {
+          "clinical": {
+            "name": "data_clinical_formatted.parquet",
+            "size": 1020432
+          },
+          "METH": {
+            "name": "data_methylation_per_gene_formatted.parquet",
+            "size": 972869645
+          },
+          "RNA": {
+            "name": "data_mrna_seq_v2_rsem_formatted.parquet",
+            "size": 1278869041
+          }
+        }
+      }
+    },
+    "gudhi": {
+      "root": "data/gudhi",
+      "generator": "gudhi.datasets.generators.points.sphere",
+      "n_samples": 4096,
+      "radius": 1.0,
+      "numpy_seed": 42
+    }
+  },
+  "robustness": {
+    "design": "one-factor-at-a-time",
+    "factors": {
+      "learning_rate": [
+        1e-06,
+        1e-05,
+        0.0001,
+        0.001,
+        0.01
+      ],
+      "drop_p": [
+        0.0,
+        0.1,
+        0.3,
+        0.5,
+        0.9
+      ],
+      "latent_dim": [
+        2,
+        8,
+        29
+      ],
+      "beta": [
+        0.5,
+        1.0,
+        2.0
+      ],
+      "loss_reduction": [
+        "mean",
+        "sum"
+      ],
+      "scaling": [
+        "MINMAX",
+        "STANDARD"
+      ],
+      "n_layers": [
+        2,
+        3
+      ]
+    }
+  },
+  "interactions": []
+}
