@@ -85,7 +85,7 @@ def main():
         sys.path.insert(0, str(ROOT))
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-    from src.core_real_final.load_config import load_config, training_configs
+    from src.core.load_config import load_config, training_configs
 
     settings = load_config(args.config.expanduser())
     dataset = args.dataset or settings.get("dataset", "tcga")
@@ -290,7 +290,7 @@ def main():
             ] + ["final_lucas_test: test split, eval mode, final model, measured once after training."]
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     if dataset == "tcga" and (output / "posterior_index.jsonl").is_file():
-        from src.core_real_final.downstream import analyze_posteriors
+        from src.analysis.downstream import analyze_posteriors
 
         analyze_posteriors(output, annotation, target=tcga_settings["label"])
     print(output, flush=True)

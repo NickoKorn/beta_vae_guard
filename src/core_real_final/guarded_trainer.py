@@ -63,8 +63,9 @@ class GuardedTrainer(GeneralTrainer):
                  guard_options=None, on_epoch=None, lucas_epsilon=0.01, lucas_delta=0.01,
                  lucas_confirm_epochs=3, collapse_eval_batch_size=2048, lucas_handover=True,
                  max_restarts=15, control_epochs=100, control_steps=None, beta_final_window=20,
-                 ring_buffer_size=20, min_handover_epoch=0, activation_window_epochs=6, handover_checkpoint_dir=None,
-                 lucas_observe=False, observe_until_end=False, monitor_epsilons=None, **kwargs):
+                 ring_buffer_size=20, min_handover_epoch=0, activation_window_epochs=6,
+                 handover_checkpoint_dir=None, lucas_observe=False, observe_until_end=False,
+                 monitor_epsilons=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.collapse_output = Path(collapse_output)
         self.collapse_threshold = float(collapse_threshold)
@@ -380,6 +381,7 @@ class GuardedTrainer(GeneralTrainer):
                     self.first_active_epoch_number = epoch + 1
                 self._push_ring_snapshot(epoch, observation, alive)
             elif self.first_active_epoch_number is None:
+                # An inactive initialization has no earlier representation to restore.
                 if epoch + 1 >= self.activation_window_epochs and epoch >= self.min_handover_epoch:
                     self.phase, self.fail_reason = "failed", "never_active_within_start_window"
             elif epoch >= self.min_handover_epoch:
@@ -585,7 +587,7 @@ class GuardedTrainer(GeneralTrainer):
 
     def _export_posteriors(self, epoch, beta, *, event="checkpoint", attempt=0):
         """Export the posteriors and reconstruction scores used by the analyses."""
-        from .reconstruction import reconstruction_r2
+        from ..analysis.latent import reconstruction_r2
 
         path = Path("posteriors") / f"epoch{epoch + 1}_{event}_attempt{attempt}.npz"
         (self.collapse_output / path).parent.mkdir(parents=True, exist_ok=True)
@@ -722,8 +724,10 @@ class GuardedTrainer(GeneralTrainer):
                     self._lucas_observe_epoch_end(epoch)
                 record = self._record_epoch(epoch, train_parts)
                 if export_posteriors:
-                    if self.lucas_handover and record["lucas_full_collapse_train_eval"]:
-                        event = "pi_collapse" if record["state"] == "hold" else "annealing_collapse"
+                    if record.get("lookback_handover"):
+                        event = "annealing_collapse"
+                    elif self.lucas_handover and record["state"] == "hold" and record["lucas_full_collapse_train_eval"]:
+                        event = "pi_collapse"
                     elif self.lucas_handover and self.phase in ("done", "failed"):
                         event = self.phase
                     elif epoch == epochs - 1 or self.stop_epoch == epoch:

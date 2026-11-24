@@ -1,7 +1,0 @@
-autoencodix @ git+https://github.com/jan-forest/autoencodix_package.git@b405aa3ec037552370805fb3c9f0324c3baa6895
-gudhi
-numpy
-pandas
-pyarrow
-scikit-learn
-matplotlib

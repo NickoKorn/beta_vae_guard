@@ -26,8 +26,11 @@ def collect_results(root):
         if not name:
             continue
         records = [json.loads(line) for line in history_path.read_text().splitlines() if line.strip()]
-        collapse = next((row for row in records if row.get("lucas_full_collapse_train_eval") is True), None)
         protocol = summary.get("lucas_handover") or {}
+        if "activation_window_epochs" in protocol:
+            collapse = next((row for row in records if row.get("lookback_handover")), None)
+        else:
+            collapse = next((row for row in records if row.get("lucas_full_collapse_train_eval") is True), None)
         success = summary.get("form") == "controlvae" and protocol.get("phase") == "done" and protocol.get("final_lucas_train_eval", {}).get(
             "lucas_full_collapse_train_eval") is False
         attempt = protocol.get("restarts")
