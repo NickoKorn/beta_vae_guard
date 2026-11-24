@@ -19,7 +19,7 @@ from itertools import product
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIG = ROOT / "configs" / "varix.json"
+CONFIG = ROOT / "configs" / "guarded_varix.json"
 
 # Top-level sections of configs/varix.json (a typo such as "trainig" fails instead of being ignored).
 # "interactions" is optional (factor blocks for training_configs); "status" is output and dropped below.

@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = Path(__file__).with_name("guarded_varix.json")
+DEFAULT_CONFIG = ROOT / "configs" / "guarded_varix.json"
 
 
 def print_lucas(trainer, epoch, record):
@@ -85,7 +85,7 @@ def main():
         sys.path.insert(0, str(ROOT))
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-    from src.core.load_config import load_config, training_configs
+    from src.core_real_final.load_config import load_config, training_configs
 
     settings = load_config(args.config.expanduser())
     dataset = args.dataset or settings.get("dataset", "tcga")

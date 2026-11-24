@@ -56,6 +56,20 @@ def lucas_collapse(kl_per_sample, *, epsilon=0.01, delta=0.01):
         }
 
 
+def reconstruction_r2(x, recon):
+    """Reconstruction R^2 of a samples-by-features matrix (sample, feature, and variance-weighted)."""
+    x, recon = np.asarray(x, dtype=np.float64), np.asarray(recon, dtype=np.float64)
+    if x.shape != recon.shape or x.ndim != 2:
+        raise ValueError("x and recon must be matching samples-by-features matrices")
+    sse = (x - recon) ** 2
+    sst_sample = ((x - x.mean(1, keepdims=True)) ** 2).sum(1)
+    sst_feature = ((x - x.mean(0)) ** 2).sum(0)
+    ok_s, ok_f = sst_sample > 0, sst_feature > 0
+    return dict(r2_sample=float(np.mean(1 - sse.sum(1)[ok_s] / sst_sample[ok_s])),
+                r2_feature=float(np.mean(1 - sse.sum(0)[ok_f] / sst_feature[ok_f])),
+                r2_weighted=float(1 - sse.sum() / sst_feature.sum()))
+
+
 class GuardedTrainer(GeneralTrainer):
     """Closed-loop ControlVAE trainer with Lucas full-collapse detection and ring-buffer rollback."""
 
@@ -587,8 +601,6 @@ class GuardedTrainer(GeneralTrainer):
 
     def _export_posteriors(self, epoch, beta, *, event="checkpoint", attempt=0):
         """Export the posteriors and reconstruction scores used by the analyses."""
-        from ..analysis.latent import reconstruction_r2
-
         path = Path("posteriors") / f"epoch{epoch + 1}_{event}_attempt{attempt}.npz"
         (self.collapse_output / path).parent.mkdir(parents=True, exist_ok=True)
         arrays, scores = {}, {}

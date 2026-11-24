@@ -21,7 +21,7 @@ import time
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
-BASE_CONFIG = Path(__file__).with_name("guarded_varix.json")
+BASE_CONFIG = REPO / "configs" / "guarded_varix.json"
 
 TCGA_GROUPS = ("weak_signal_lowvar", "ontix_standard", "all_classes")
 GUDHI_TOPOLOGIES = ("circle", "sphere")

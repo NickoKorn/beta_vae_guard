@@ -2,6 +2,8 @@
 
     latent_metrics(pipeline, mu)       AUTOENCODIX-native total correlation and coverage
     measure_preservation(original, z)  ZADU: LCMC (local), Spearman (global), steadiness/cohesiveness
+    diagrams(points, dims, n)          GUDHI persistent homology H0/H1/H2 (synthetic point clouds)
+    n_long_bars(bars)                  estimated Betti number from persistence bars
     evaluate_pipeline(pipeline, out)   test-split report: KL per dimension, TC, coverage,
                                        preservation, downstream (AUTOENCODIX evaluate), native plots
     python -m src.analysis.latent PIPELINE [--output DIR]
@@ -12,8 +14,49 @@ from pathlib import Path
 
 import numpy as np
 
-from src.core.guarded_trainer import KL_per_dim
-from src.analysis.plots import plot_all
+from src.core_real_final.guarded_trainer import kl_per_sample, lucas_collapse
+
+def reconstruction_r2(x, recon):
+    """Reconstruction R^2 of a samples-by-features matrix, three conventions.
+
+    r2_sample    AUTOENCODIX (reproducibility repo, src/utils/utils.py):
+                 torcheval r2_score(recon.T, x.T, multioutput="uniform_average"), i.e. R^2 of each
+                 sample's profile over the features, averaged over samples
+    r2_feature   classic R^2 per feature over the samples (sklearn r2_score, uniform average);
+                 features without variance in this split are left out
+    r2_weighted  1 - sum SSE / sum SST over all features (sklearn "variance_weighted")
+    """
+    x, recon = np.asarray(x, dtype=np.float64), np.asarray(recon, dtype=np.float64)
+    if x.shape != recon.shape or x.ndim != 2:
+        raise ValueError("x and recon must be matching samples-by-features matrices")
+    sse = (x - recon) ** 2
+    sst_sample = ((x - x.mean(1, keepdims=True)) ** 2).sum(1)
+    sst_feature = ((x - x.mean(0)) ** 2).sum(0)
+    ok_s, ok_f = sst_sample > 0, sst_feature > 0
+    return dict(r2_sample=float(np.mean(1 - sse.sum(1)[ok_s] / sst_sample[ok_s])),
+                r2_feature=float(np.mean(1 - sse.sum(0)[ok_f] / sst_feature[ok_f])),
+                r2_weighted=float(1 - sse.sum() / sst_feature.sum()))
+
+
+def pca_baseline(data, k):
+    """PCA with k components as the linear reference, evaluated like AUTOENCODIX.
+
+    data: load_data.preprocessed(group, split). As AUTOENCODIX (evaluate/_general_evaluator.py,
+    reference_methods "PCA"): the PCA is fitted on train + valid + test concatenated, the classifier is
+    LogisticRegression(max_iter=1000) fitted on train, scored with roc_auc_ovo on valid. Also the
+    reconstruction R^2 of valid (inverse_transform) and the explained variance.
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import get_scorer
+
+    pca = PCA(n_components=k).fit(np.vstack([data[s]["x"] for s in ("train", "valid", "test")]))
+    z_train, z_valid = (pca.transform(data[s]["x"]) for s in ("train", "valid"))
+    classifier = LogisticRegression(max_iter=1000).fit(z_train, data["train"]["y"])
+    return dict(k=k, explained_variance=float(pca.explained_variance_ratio_.sum()),
+                auroc_ovo=float(get_scorer("roc_auc_ovo")(classifier, z_valid, data["valid"]["y"])),
+                **reconstruction_r2(data["valid"]["x"], pca.inverse_transform(z_valid)))
+
 
 def as_array(value):
     import numpy as np
@@ -114,7 +157,10 @@ def evaluate_pipeline(pipeline, output, target="CANCER_TYPE_ACRONYM"):
     mu = np.zeros_like(logvar) if mu_all_zero else as_array(raw_mu)
     import torch
 
-    R_j, v_j = KL_per_dim(torch.as_tensor(mu), torch.as_tensor(logvar))
+    mu_t = torch.as_tensor(mu, dtype=torch.float64)
+    kl_samples = kl_per_sample(mu_t, torch.as_tensor(logvar))
+    R_j = kl_samples.mean(dim=0)
+    v_j = 0.5 * mu_t.var(dim=0, correction=int(len(mu) > 1))
     report = {"split": "test", "mu_all_zero_not_stored_by_autoencodix": bool(mu_all_zero),
               "posterior_collapse": {
                   "kl_per_dimension_nats": R_j.tolist(),
@@ -154,9 +200,86 @@ def evaluate_pipeline(pipeline, output, target="CANCER_TYPE_ACRONYM"):
         report["downstream"] = {"target": target, "metric": "roc_auc_ovo",
                                 "estimator": "LogisticRegression", "split": "use-split",
                                 "report": "downstream.csv"}
-    report["plots"] = plot_all(pipeline, output, target=target)
     (output / "evaluation.json").write_text(json.dumps(report, indent=2, allow_nan=False))
     return report
+
+
+def quality_over_time(branch, original, sample_ids, *, ks=(5, 20), epsilon=0.01, delta=0.01):
+    """TC, coverage and ZADU preservation of the validation posterior means at every exported epoch.
+
+    branch: folder of one continuation (posterior_index.jsonl + posteriors/*.npz, as written by
+    src/experiments/last_axis_monitor.py); original: preprocessed validation inputs (samples x
+    features) in the order of sample_ids. TC and coverage are AUTOENCODIX's formulas
+    (doi:10.3390/e21100921, Eq. 2/3), computed on all dimensions and on the Lucas-active ones only:
+    collapsed dimensions have a near-constant mean, which makes TC degenerate. Returns a DataFrame.
+    """
+    import pandas as pd
+    import torch
+    from autoencodix.visualize.visualize import Visualizer
+
+    branch, original = Path(branch), np.asarray(original, dtype=float)
+    order = {str(sid): i for i, sid in enumerate(sample_ids)}
+    rows = []
+    for line in (branch / "posterior_index.jsonl").read_text().splitlines():
+        entry = json.loads(line)
+        data = np.load(branch / entry["path"], allow_pickle=True)
+        ids = [str(sid) for sid in data["valid_ids"]]
+        x = original[[order[sid] for sid in ids]]               # inputs in the order of the posteriors
+        mu, logvar = data["valid_mu"].astype(float), data["valid_logvar"].astype(float)
+        kl = kl_per_sample(torch.as_tensor(mu), torch.as_tensor(logvar))
+        active = [j for j in range(mu.shape[1])
+                  if j not in lucas_collapse(kl, epsilon=epsilon, delta=delta)["collapsed_dimensions"]]
+        # Varix sets mu < 1e-7 to exactly 0: a high share means many tied coordinates, which also
+        # affects every distance-based score below (LCMC, steadiness/cohesiveness, Spearman)
+        row = dict(epoch_number=entry["epoch_number"], beta=entry.get("beta"), active_axes=len(active),
+                   clamped_mu_share=float((mu == 0).mean()))
+        for label, columns in (("all", list(range(mu.shape[1]))), ("active", active)):
+            frame = pd.DataFrame(mu[:, columns])
+            with np.errstate(all="ignore"):
+                row[f"tc_{label}"] = (float(Visualizer._total_correlation(frame))
+                                      if len(columns) >= 2 else float("nan"))
+                row[f"coverage_{label}"] = float(Visualizer._coverage_calc(frame)) if columns else float("nan")
+        try:
+            report = measure_preservation(x, mu, ks=ks)
+        except ValueError as error:                 # e.g. a fully collapsed (constant) embedding
+            row["preservation"] = f"undefined: {error}"
+            rows.append(row)
+            continue
+        row["preservation"] = "ok"
+        for entry_ in report["local"]:
+            row[f"lcmc_k{entry_['k']}"] = entry_["scores"]["lcmc"]
+        row["spearman_global"] = report["global"][0]["scores"]["spearman_rho"]
+        for entry_ in report["clustering"]:
+            row[f"steadiness_k{entry_['k']}"] = entry_["scores"]["steadiness"]
+            row[f"cohesiveness_k{entry_['k']}"] = entry_["scores"]["cohesiveness"]
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("epoch_number").reset_index(drop=True)
+
+
+def diagrams(points, dims=(0, 1, 2), n=500):
+    """Persistent homology H0/H1/H2 via farthest-point subsampling and GUDHI RipsPersistence."""
+    from gudhi.sklearn.rips_persistence import RipsPersistence
+    from gudhi.subsampling import choose_n_farthest_points
+
+    points = np.asarray(points, dtype=float)
+    if n and len(points) > n:
+        points = np.asarray(choose_n_farthest_points(points=points, nb_points=n, starting_point=0))
+    out = RipsPersistence(homology_dimensions=list(dims)).fit_transform([points])[0]
+    return dict(zip(dims, out))
+
+
+def n_long_bars(bars, min_ratio=0.25, max_bars=10):
+    """Estimate Betti number: infinite bars plus finite bars before the largest length gap."""
+    from gudhi.representations import DiagramSelector
+
+    bars = np.asarray(bars).reshape(-1, 2)
+    finite = DiagramSelector(use=True, point_type="finite").fit_transform([bars])[0]
+    p = np.sort(finite[:, 1] - finite[:, 0])[::-1][:max_bars]
+    long = 0
+    if len(p) == 1 or (len(p) > 1 and p[0] > 0):
+        k = 1 if len(p) == 1 else int(np.argmin(p[1:] / p[:-1])) + 1
+        long = min(k, int((p >= min_ratio * p[0]).sum()))
+    return len(bars) - len(finite) + long
 
 
 def main():
