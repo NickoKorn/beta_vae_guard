@@ -63,7 +63,7 @@ class GuardedTrainer(GeneralTrainer):
                  guard_options=None, on_epoch=None, lucas_epsilon=0.01, lucas_delta=0.01,
                  lucas_confirm_epochs=3, collapse_eval_batch_size=2048, lucas_handover=True,
                  max_restarts=15, control_epochs=100, control_steps=None, beta_final_window=20,
-                 ring_buffer_size=20, min_handover_epoch=0, handover_checkpoint_dir=None,
+                 ring_buffer_size=20, min_handover_epoch=0, activation_window_epochs=6, handover_checkpoint_dir=None,
                  lucas_observe=False, observe_until_end=False, monitor_epsilons=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.collapse_output = Path(collapse_output)
@@ -99,6 +99,7 @@ class GuardedTrainer(GeneralTrainer):
             ("control_epochs", control_epochs, 1),
             ("beta_final_window", beta_final_window, 1),
             ("min_handover_epoch", min_handover_epoch, 0),
+            ("activation_window_epochs", activation_window_epochs, 1),
         ):
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -113,6 +114,8 @@ class GuardedTrainer(GeneralTrainer):
         self.control_steps = control_steps
         self.beta_final_window = beta_final_window
         self.min_handover_epoch = min_handover_epoch
+        self.activation_window_epochs = activation_window_epochs
+        self.first_active_epoch_number = None
         self.monitor_epsilons = sorted({self.lucas_epsilon, *(float(e) for e in (monitor_epsilons or []))})
 
         self.handover_checkpoint_dir = (Path(handover_checkpoint_dir) if handover_checkpoint_dir is not None
@@ -373,15 +376,16 @@ class GuardedTrainer(GeneralTrainer):
         lookback = False
         if self.phase == "annealing":
             if not collapsed:
-                if observation["gap"] is not None:
-                    self._push_ring_snapshot(epoch, observation, alive)
+                if self.first_active_epoch_number is None:
+                    self.first_active_epoch_number = epoch + 1
+                self._push_ring_snapshot(epoch, observation, alive)
+            elif self.first_active_epoch_number is None:
+                if epoch + 1 >= self.activation_window_epochs and epoch >= self.min_handover_epoch:
+                    self.phase, self.fail_reason = "failed", "never_active_within_start_window"
             elif epoch >= self.min_handover_epoch:
                 chosen = self._select_ring_checkpoint()
-                if chosen is not None:
-                    restart = (chosen["epoch"], chosen)
-                    lookback = True
-                else:
-                    self.phase, self.fail_reason = "failed", "collapsed_before_handover"
+                restart = (chosen["epoch"], chosen)
+                lookback = True
         elif self.phase == "control":
             if collapsed:
                 if self.restarts >= self.max_restarts:
@@ -401,6 +405,7 @@ class GuardedTrainer(GeneralTrainer):
             "attempt": attempt,
             "restarts": self.restarts,
             "lookback_handover": lookback,
+            "first_active_epoch_number": self.first_active_epoch_number,
             "trigger": "single_lucas_ring",
             "k": getattr(self, "_current_level", None),
             "n_collapsed_trigger_eps": len(collapsed_dims),
@@ -446,6 +451,8 @@ class GuardedTrainer(GeneralTrainer):
             "control_epochs": self.control_epochs,
             "control_steps": self.control_steps,
             "min_handover_epoch": self.min_handover_epoch,
+            "activation_window_epochs": self.activation_window_epochs,
+            "first_active_epoch_number": self.first_active_epoch_number,
             "steps_per_epoch": len(self._trainloader),
             "handover_trigger": "single_lucas_ring",
             "trigger_epsilon": self.lucas_epsilon,
@@ -742,7 +749,8 @@ class GuardedTrainer(GeneralTrainer):
                     epoch += 1
         if self.lucas_handover:
             if self.phase == "annealing":
-                self.fail_reason = "no_handover_within_budget"
+                self.fail_reason = ("no_handover_within_budget" if self.first_active_epoch_number is not None
+                                    else "never_active_within_training_budget")
             self._cleanup_level_checkpoints()
         self._write_summary(history_path)
         self._result.model = next(self._model.children())
