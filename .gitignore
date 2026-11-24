@@ -1,10 +1,16 @@
 /*
 !/.gitignore
 !/README.md
+!/pyproject.toml
+!/uv.lock
+!/.python-version
 !/configs/
 !/notebooks/
 !/src/
+!/windows/
 
-__pycache__/
+**/.venv/
+**/.venv-*/
+**/__pycache__/
 *.pyc
 .ipynb_checkpoints/

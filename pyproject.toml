@@ -1,0 +1,11 @@
+[project]
+name = "beta-guard-vae-local"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "autoencodix @ git+https://github.com/jan-forest/autoencodix_package.git@b405aa3ec037552370805fb3c9f0324c3baa6895",
+    "gudhi", "numpy", "pandas", "pyarrow", "scikit-learn", "torch", "zadu>=0.5.4", "matplotlib",
+]
+
+[tool.uv]
+cache-dir = ".uv-cache"
