@@ -6,6 +6,7 @@ param(
     [string]$Output = "",
     [string]$Config = "",
     [switch]$Single,
+    [int]$Workers = 1,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$TrainingArgs
 )
@@ -49,6 +50,7 @@ if (-not (Test-Path $Marker) -or (Get-Content $Marker -Raw) -ne $DependencyHash)
 }
 
 $env:PYTHONHASHSEED = "1"
+$env:PYTHONUTF8 = "1"
 $env:CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 & $Python -c "import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'not available'); raise SystemExit(0 if torch.cuda.is_available() else 1)"
 if ($LASTEXITCODE -ne 0) { throw "CUDA GPU is unavailable. Check the NVIDIA driver and the PyTorch CUDA installation." }
@@ -60,8 +62,15 @@ $RunConfig = Join-Path $Output ("config-eps001-" + (Get-Date -Format "yyyyMMdd-H
 $Json = $ConfigData | ConvertTo-Json -Depth 100
 [System.IO.File]::WriteAllText($RunConfig, $Json, [System.Text.UTF8Encoding]::new($false))
 
-$Arguments = @("-u", "-m", "src.core_real_final.main", $Output, "--config", $RunConfig)
-if (-not $Single) { $Arguments += "--grid" }
+if ($Workers -lt 1) { throw "Workers must be at least 1." }
+if ($Workers -gt 1 -and $Single) { throw "Use either -Single or multiple workers." }
+if ($Workers -gt 1 -and $TrainingArgs) { throw "Edit the config for a parallel grid; extra TrainingArgs are only supported by the serial runner." }
+if ($Workers -gt 1) {
+    $Arguments = @("-u", "-m", "src.core_real_final.parallel_grid", $Output, "--config", $RunConfig, "--workers", "$Workers")
+} else {
+    $Arguments = @("-u", "-m", "src.core_real_final.main", $Output, "--config", $RunConfig)
+    if (-not $Single) { $Arguments += "--grid" }
+}
 if ($TrainingArgs) { $Arguments += $TrainingArgs }
 Write-Host "Output: $Output"
 Write-Host "Config: $RunConfig"

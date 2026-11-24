@@ -31,7 +31,7 @@ CONFIG_SECTIONS = {
 
 def load_config(path=CONFIG):
     """Read a JSON configuration, excluding generated run status."""
-    settings = json.loads(Path(path).read_text())
+    settings = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(settings, dict):
         raise TypeError("Settings must be a JSON object")
     # "status" is output, not input: the progress table written by src/experiments/run_status.py.
