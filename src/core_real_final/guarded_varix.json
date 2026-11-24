@@ -60,7 +60,7 @@
     "enabled": true,
     "form": "controlvae",
     "kp": 0.002,
-    "ki": 0.001,
+    "ki": 0.06,
     "gains_per": "step",
     "beta_min": 0.0,
     "beta_max": "schedule",
@@ -79,8 +79,8 @@
       "ring_buffer_size": 20,
       "min_handover_epoch": 5,
       "collapse_eval_batch_size": 2048,
-      "description": "Bei vollem Lucas-Kollaps (ab min_handover_epoch) den letzten gesunden Checkpoint laden. ControlVAE-PI regelt dessen mittlere Trainings-Gesamt-KL 1000 Trainingsschritte lang. Bei erneutem Kollaps einen Checkpoint weiter zurückgehen.",
-      "control_steps": 1000,
+      "description": "Bei vollem Lucas-Kollaps (ab min_handover_epoch) den letzten gesunden Checkpoint laden. ControlVAE-PI regelt dessen mittlere Trainings-Gesamt-KL pro Batch (Step) 100 vollständige Epochen lang. Bei erneutem Kollaps einen Checkpoint weiter zurückgehen.",
+      "control_steps": null,
       "control_epochs": 100,
       "beta_final_window": 20
     }
