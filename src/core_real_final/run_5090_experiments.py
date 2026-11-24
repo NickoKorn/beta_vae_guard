@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 BASE_CONFIG = Path(__file__).with_name("guarded_varix.json")
@@ -116,7 +117,11 @@ def run_one(job: dict, *, out_dir: Path, cfg_path: Path, env: dict) -> tuple[str
     if (run_dir / "guard_summary.json").is_file():
         return (name, "skipped", 0.0)
     if run_dir.exists():
-        shutil.rmtree(run_dir)
+        interrupted = out_dir / "interrupted_runs"
+        interrupted.mkdir(parents=True, exist_ok=True)
+        archived = interrupted / f"{name}-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        run_dir.rename(archived)
+        print(f"[{time.strftime('%H:%M:%S')}] PRESERVED incomplete run at {archived}", flush=True)
 
     logs_dir = out_dir / "worker_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +145,14 @@ def run_one(job: dict, *, out_dir: Path, cfg_path: Path, env: dict) -> tuple[str
     dt = time.time() - t0
     status = "ok" if res.returncode == 0 else f"err({res.returncode})"
     print(f"[{time.strftime('%H:%M:%S')}] DONE  {name} -> {status} ({dt:.1f}s)", flush=True)
+    if res.returncode:
+        log_path = logs_dir / f"{name}.log"
+        print(f"FAILED LOG: {log_path}", flush=True)
+        try:
+            tail = log_path.read_text(errors="replace").splitlines()[-30:]
+            print("\n".join(tail), flush=True)
+        except OSError as error:
+            print(f"Could not read failure log: {error}", flush=True)
     return (name, status, dt)
 
 
@@ -214,14 +227,27 @@ def main():
 
     print(f"Starting suite={args.suite}: {total} runs ({len(parallel_jobs)} @ {args.workers} workers, "
           f"{len(sequential_jobs)} all_classes @ 1 worker)", flush=True)
+    results = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        list(pool.map(lambda j: run_one(j, out_dir=out_dir, cfg_path=cfg_path, env=env), parallel_jobs))
+        results.extend(pool.map(lambda j: run_one(j, out_dir=out_dir, cfg_path=cfg_path, env=env), parallel_jobs))
     for job in sequential_jobs:
-        run_one(job, out_dir=out_dir, cfg_path=cfg_path, env=env)
+        results.append(run_one(job, out_dir=out_dir, cfg_path=cfg_path, env=env))
 
     csv_path = write_summary_csv(out_dir)
-    print(f"[{time.strftime('%H:%M:%S')}] ALL DONE -> {csv_path}", flush=True)
+    failed = [result for result in results if result[1].startswith("err(")]
+    status_path = out_dir / "launcher_status.csv"
+    with status_path.open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("run_name", "status", "elapsed_seconds", "log_path"))
+        for name, status, elapsed in results:
+            writer.writerow((name, status, f"{elapsed:.1f}", str(out_dir / "worker_logs" / f"{name}.log")))
+    if failed:
+        print(f"Finished with {len(failed)} failed runs out of {len(results)}. "
+              f"Inspect {status_path} and worker_logs.", flush=True)
+        return 1
+    print(f"ALL DONE -> {csv_path}; run statuses -> {status_path}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,6 +1,7 @@
 """Load TCGA data for Varix."""
 
 import contextlib
+import os
 from pathlib import Path
 
 
@@ -112,7 +113,16 @@ def gudhi(topology, folder, gudhi_config):
         columns = [f"x{i}" for i in range(dimensions[topology])]
         index = [f"{topology}_{i}" for i in range(n_samples)]
         frame = pd.DataFrame(coordinates, columns=columns, index=index)
-        frame.to_parquet(path)
+        tmp_path = path.with_suffix(f".{os.getpid()}.tmp.parquet")
+        try:
+            frame.to_parquet(tmp_path)
+            tmp_path.replace(path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+            if path.is_file():
+                frame = pd.read_parquet(path)
+            else:
+                raise
 
     expected_shape = (n_samples, dimensions[topology])
     if frame.shape != expected_shape:
