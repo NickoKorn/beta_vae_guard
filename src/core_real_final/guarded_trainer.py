@@ -27,6 +27,8 @@ def lucas_quantile(kl_per_sample, *, delta=0.01):
     how far each axis is from the collapse threshold.
     """
     sample_count = kl_per_sample.shape[0]
+    # Example: with 10,000 samples and delta=0.01, k=ceil(0.99*10,000)=9,900.
+    # kthvalue then returns the 9,900th-smallest KL per dimension, i.e. the empirical 99th percentile.
     return kl_per_sample.kthvalue(math.ceil((1 - delta) * sample_count), dim=0).values.tolist()
 
 
