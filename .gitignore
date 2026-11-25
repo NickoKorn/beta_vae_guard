@@ -7,7 +7,6 @@
 !/configs/
 !/notebooks/
 !/src/
-!/windows/
 
 **/.venv/
 **/.venv-*/
