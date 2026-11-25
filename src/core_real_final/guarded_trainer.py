@@ -1,19 +1,19 @@
+from collections.abc import Callable, Iterable, Mapping
 import json
 import math
 from pathlib import Path
 import random
 from tempfile import NamedTemporaryFile
+from typing import Any
+
+from .beta_scheduler import BetaScheduler
 
 import numpy as np
 import torch
 from autoencodix.trainers._general_trainer import GeneralTrainer
 from torch.utils.data import DataLoader
 
-from .beta_scheduler import BetaScheduler
-
-
 def kl_per_sample(mu, logvar):
-    """KL(q(z|x) || N(0, I)) per sample and latent dimension, float64, shape (samples, dimensions)."""
     mu, logvar = mu.double(), logvar.double()
     posterior = torch.distributions.Normal(mu, (0.5 * logvar).exp())
     prior = torch.distributions.Normal(torch.zeros_like(mu), torch.ones_like(mu))
@@ -21,11 +21,7 @@ def kl_per_sample(mu, logvar):
 
 
 def lucas_quantile(kl_per_sample, *, delta=0.01):
-    """(1 - delta) quantile of the KL per dimension (Q99 for delta = 0.01).
-
-    Dimension j is Lucas-collapsed exactly when this value is below epsilon, so it shows
-    how far each axis is from the collapse threshold.
-    """
+    """(1 - delta) quantile of the KL per dimension (Q99 for delta = 0.01)."""
     sample_count = kl_per_sample.shape[0]
     # Example: with 10,000 samples and delta=0.01, k=ceil(0.99*10,000)=9,900.
     # kthvalue then returns the 9,900th-smallest KL per dimension, i.e. the empirical 99th percentile.
@@ -33,7 +29,7 @@ def lucas_quantile(kl_per_sample, *, delta=0.01):
 
 
 def lucas_collapse(kl_per_sample, *, epsilon=0.01, delta=0.01):
-    """Mark axes with KL below epsilon for at least 1 - delta of the samples (Lucas et al., 2019)."""
+    """Lucas et al., 2019)."""
     if not math.isfinite(epsilon) or epsilon <= 0:
         raise ValueError("epsilon must be finite and positive")
     if not math.isfinite(delta) or not 0 <= delta < 1:
@@ -43,8 +39,8 @@ def lucas_collapse(kl_per_sample, *, epsilon=0.01, delta=0.01):
         if kl.ndim != 2 or min(kl.shape) < 1 or not torch.isfinite(kl).all() or (kl < 0).any():
             raise ValueError("Expected finite nonnegative KL of shape (samples, dimensions)")
         counts = (kl < epsilon).sum(dim=0)
-        fractions = counts.double() / kl.shape[0]
-        collapsed = fractions >= 1 - delta
+        proportion_under_epsilon = counts.double() / kl.shape[0]
+        collapsed = proportion_under_epsilon >= 1 - delta
         return {
             "epsilon_nats": float(epsilon),
             "delta": float(delta),
@@ -52,104 +48,98 @@ def lucas_collapse(kl_per_sample, *, epsilon=0.01, delta=0.01):
             "mean_kl_per_dimension_nats": kl.mean(dim=0).cpu().tolist(),
             "mean_total_kl_nats": kl.sum(dim=1).mean().item(),
             "counts_below_epsilon": counts.cpu().tolist(),
-            "fractions_below_epsilon": fractions.cpu().tolist(),
+            "fractions_below_epsilon": proportion_under_epsilon.cpu().tolist(),
             "collapsed_dimensions": torch.where(collapsed)[0].cpu().tolist(),
             "n_noncollapsed_dimensions": int((~collapsed).sum().item()),
         }
 
 
 def reconstruction_r2(x, recon):
-    """Reconstruction R^2 of a samples-by-features matrix (sample, feature, and variance-weighted)."""
     x, recon = np.asarray(x, dtype=np.float64), np.asarray(recon, dtype=np.float64)
     if x.shape != recon.shape or x.ndim != 2:
         raise ValueError("x and recon must be matching samples-by-features matrices")
-    sse = (x - recon) ** 2
-    sst_sample = ((x - x.mean(1, keepdims=True)) ** 2).sum(1)
-    sst_feature = ((x - x.mean(0)) ** 2).sum(0)
-    ok_s, ok_f = sst_sample > 0, sst_feature > 0
-    return dict(r2_sample=float(np.mean(1 - sse.sum(1)[ok_s] / sst_sample[ok_s])),
-                r2_feature=float(np.mean(1 - sse.sum(0)[ok_f] / sst_feature[ok_f])),
-                r2_weighted=float(1 - sse.sum() / sst_feature.sum()))
+    sum_squared_error = (x - recon) ** 2
+    total_sum_of_squares_per_sample = ((x - x.mean(1, keepdims=True)) ** 2).sum(1)
+    total_sum_of_squares_per_feature = ((x - x.mean(0)) ** 2).sum(0)
+    ok_s, ok_f = total_sum_of_squares_per_sample > 0, total_sum_of_squares_per_feature > 0
+    return dict(r2_sample=float(np.mean(1 - sum_squared_error.sum(1)[ok_s] / total_sum_of_squares_per_sample[ok_s])),
+                r2_feature=float(np.mean(1 - sum_squared_error.sum(0)[ok_f] / total_sum_of_squares_per_feature[ok_f])),
+                r2_weighted=float(1 - sum_squared_error.sum() / total_sum_of_squares_per_feature.sum()))
 
 
 class GuardedTrainer(GeneralTrainer):
-    """Closed-loop ControlVAE trainer with Lucas full-collapse detection and ring-buffer rollback."""
+    """Closed-loop ControlVAE trainer with Lucas full-collapse detection and buffer rollback."""
 
-    def __init__(self, *args, collapse_threshold=0.01, collapse_output, guard_enabled=True,
-                 guard_options=None, on_epoch=None, lucas_epsilon=0.01, lucas_delta=0.01,
-                 lucas_confirm_epochs=3, collapse_eval_batch_size=2048, lucas_handover=True,
-                 max_restarts=15, control_epochs=100, control_steps=None, beta_final_window=20,
-                 ring_buffer_size=20, min_handover_epoch=0, activation_window_epochs=6,
-                 handover_checkpoint_dir=None, lucas_observe=False, observe_until_end=False,
-                 monitor_epsilons=None, **kwargs):
+    def __init__(
+        self,
+        *args: Any,
+        collapse_output: Path | str,
+        guard_enabled: bool = True,
+        guard_options: Mapping[str, Any] | None = None,
+        print_lucas_callback: Callable[[Any, int, dict[str, Any]], None] | None = None,
+        lucas_epsilon: float = 0.01,
+        lucas_delta: float = 0.01,
+        lucas_confirm_epochs: int = 3,
+        collapse_eval_batch_size: int = 2048,
+        lucas_handover: bool = True,
+        max_restarts: int = 15,
+        control_epochs: int = 100,
+        control_steps: int | None = None,
+        beta_final_window: int = 20,
+        ring_buffer_size: int = 20,
+        min_handover_epoch: int = 0,
+        activation_window_epochs: int = 6,
+        handover_checkpoint_dir: Path | str | None = None,
+        lucas_observe: bool = False,
+        observe_until_end: bool = False,
+        monitor_epsilons: Iterable[float] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.collapse_output = Path(collapse_output)
-        self.collapse_threshold = float(collapse_threshold)
-        self.on_epoch = on_epoch
+        self.print_lucas_callback = print_lucas_callback
         if not math.isfinite(lucas_epsilon) or lucas_epsilon <= 0 or not 0 <= lucas_delta < 1:
             raise ValueError("lucas_epsilon must be positive and lucas_delta in [0, 1)")
-        self.lucas_epsilon = float(lucas_epsilon)
-        self.lucas_delta = float(lucas_delta)
-        self.lucas_confirm_epochs = int(lucas_confirm_epochs)
-        if type(collapse_eval_batch_size) is not int or collapse_eval_batch_size < 1:
-            raise ValueError("collapse_eval_batch_size must be a positive integer")
-        self.collapse_eval_batch_size = collapse_eval_batch_size
-
+        self.lucas_epsilon, self.lucas_delta = float(lucas_epsilon), float(lucas_delta)
         options = dict(guard_options or {})
         self.guard_enabled = bool(guard_enabled)
+        # guard.form: action after rollback ('controlvae' PI, 'freeze' constant beta, or 'early_stop').
         self.handover_mode = options.get("form", "controlvae")
-        self.signal = options.get("signal", "total")
         if self.handover_mode not in ("early_stop", "freeze", "controlvae"):
             raise ValueError("form must be 'early_stop', 'freeze' or 'controlvae'")
-        if self.signal not in ("max", "total"):
-            raise ValueError("signal must be 'max' or 'total'")
-
-        self.lucas_handover = bool(lucas_handover)
-        self.lucas_observe = bool(lucas_observe)
+        self.lucas_handover, self.lucas_observe = bool(lucas_handover), bool(lucas_observe)
         self.observe_until_end = bool(observe_until_end)
         if self.lucas_observe and self.lucas_handover:
             raise ValueError("Choose either lucas_observe or lucas_handover")
-
-        for name, value, minimum in (
+        if self.lucas_handover and not self.guard_enabled:
+            raise ValueError("lucas_handover requires guard_enabled=True")
+        # Validate & store integer hyperparameters (lucas_confirm_epochs is for --observe-collapse and valid logging).
+        int_params = (
+            ("lucas_confirm_epochs", lucas_confirm_epochs, 1),
+            ("collapse_eval_batch_size", collapse_eval_batch_size, 1),
             ("ring_buffer_size", ring_buffer_size, 1),
             ("max_restarts", max_restarts, 0),
             ("control_epochs", control_epochs, 1),
             ("beta_final_window", beta_final_window, 1),
             ("min_handover_epoch", min_handover_epoch, 0),
             ("activation_window_epochs", activation_window_epochs, 1),
-        ):
+        )
+        for name, value, minimum in int_params:
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
+            setattr(self, name, value)
         if control_steps is not None and (type(control_steps) is not int or control_steps < 1):
             raise ValueError("control_steps must be a positive integer")
-        if self.lucas_handover and (self.signal != "total" or not self.guard_enabled):
-            raise ValueError("lucas_handover requires signal='total' and guard_enabled=True")
-
-        self.ring_buffer_size = ring_buffer_size
-        self.max_restarts = max_restarts
-        self.control_epochs = control_epochs
         self.control_steps = control_steps
-        self.beta_final_window = beta_final_window
-        self.min_handover_epoch = min_handover_epoch
-        self.activation_window_epochs = activation_window_epochs
-        self.first_active_epoch_number = None
         self.monitor_epsilons = sorted({self.lucas_epsilon, *(float(e) for e in (monitor_epsilons or []))})
-
+        # Runtime state
         self.handover_checkpoint_dir = (Path(handover_checkpoint_dir) if handover_checkpoint_dir is not None
                                         else self.collapse_output / "handover_levels")
-        self.handover_epoch = self.stop_epoch = None
-        self.target_kl = None
-        self.phase = "annealing"
-        self.restarts = 0
-        self.fail_reason = None
-        self.gap_handover = self.setpoint_C = self.beta_handover = None
-        self._training_history = []
-        self._level_states = {}
-        self._anneal_ring = []
-        self._axis_events = None
-        self._full_collapse_streak = 0
-        self.full_collapse_first = self.full_collapse_confirmed = None
-
+        self.phase, self.restarts, self._full_collapse_streak = "annealing", 0, 0
+        self.handover_epoch = self.stop_epoch = self.target_kl = self.fail_reason = None
+        self.gap_handover = self.setpoint_C = self.beta_handover = self.first_active_epoch_number = None
+        self._axis_events = self.full_collapse_first = self.full_collapse_confirmed = None
+        self._training_history, self._level_states, self._anneal_ring = [], {}, []
         self.beta_scheduler = BetaScheduler(
             total_epochs=self._config.epochs,
             schedule=self._config.anneal_function,
@@ -160,32 +150,119 @@ class GuardedTrainer(GeneralTrainer):
         )
         self._loss_fn.annealing_scheduler = self.beta_scheduler
 
+    def train(self, epochs_overwrite=None, *, export_posteriors=False):
+        """Train from scratch with annealing, Lucas full-collapse rollback, and PI hold."""
+        epochs = epochs_overwrite or self._config.epochs
+        if epochs < 1:
+            raise ValueError("The training budget must be positive")
+        history_path = self.collapse_output / "collapse_history.jsonl"
+        if history_path.exists():
+            raise FileExistsError(f"Choose a separate output directory for this run: {history_path}")
+
+        self.collapse_output.mkdir(parents=True, exist_ok=True)
+        #autocast for floating point 32 from context manager 
+        with self._fabric.autocast():
+            epoch = 0
+            while epoch < epochs or (self.lucas_handover and self.phase == "control"):
+                self._init_buffers()
+                should_checkpoint = self._should_checkpoint(epoch)
+                self._model.train()
+                train_loss, train_parts = self._train_epoch(should_checkpoint, epoch)
+                self._log_losses(epoch, "train", train_loss, train_parts)
+                if self._validset:
+                    valid_loss, valid_parts = self._validate_epoch(should_checkpoint, epoch)
+                    self._log_losses(epoch, "valid", valid_loss, valid_parts)
+                if should_checkpoint:
+                    self._store_checkpoint(epoch)
+                restart = self._lucas_epoch_end(epoch) if self.lucas_handover else None
+                if self.lucas_observe:
+                    self._lucas_observe_epoch_end(epoch)
+                record = self._record_epoch(epoch, train_parts)
+                if export_posteriors:
+                    if record.get("lookback_handover"):
+                        event = "annealing_collapse"
+                    elif self.lucas_handover and record["state"] == "hold" and record["lucas_full_collapse_train_eval"]:
+                        event = "pi_collapse"
+                    elif self.lucas_handover and self.phase in ("done", "failed"):
+                        event = self.phase
+                    elif epoch == epochs - 1 or self.stop_epoch == epoch:
+                        event = "checkpoint"
+                    else:
+                        event = None
+                    if event:
+                        self._export_posteriors(epoch, record["beta_batch_last"],
+                                                event=event, attempt=record.get("attempt", 0))
+                if self.print_lucas_callback is not None:
+                    self.print_lucas_callback(self, epoch, record)
+                if self.stop_epoch == epoch or (
+                    (self.lucas_handover or self.lucas_observe) and self.phase in ("done", "failed")
+                ):
+                    self._finish_early(epoch, already_stored=should_checkpoint)
+                    break
+                if restart:
+                    epoch = self._restart_from(*restart)
+                    if export_posteriors:
+                        self._export_posteriors(epoch - 1, self.beta_handover * self.beta_scheduler.beta_scale,
+                                                event="handover", attempt=self.restarts)
+                else:
+                    epoch += 1
+        if self.lucas_handover:
+            if self.phase == "annealing":
+                self.fail_reason = ("no_handover_within_budget" if self.first_active_epoch_number is not None
+                                    else "never_active_within_training_budget")
+            self._cleanup_level_checkpoints()
+        self._write_summary(history_path)
+        self._result.model = next(self._model.children())
+        return self._result
+
     def _train_epoch(self, should_checkpoint, epoch):
         if len(self._trainloader) == 0:
             raise ValueError("Training requires at least one batch")
         kl_sum = None
         sample_count = 0
         batch_betas = []
-
+        #Disabling gradient calculation
         @torch.no_grad()
-        def feed_guard(_model, _inputs, output):
+        def feed_guard_while_train(_model, _inputs, output):
             nonlocal kl_sum, sample_count
             if not _model.training:
                 return
+            """
+            Original Controlvae Repo: 
+            def kl_divergence(mu, logvar):
+            batch_size = mu.size(0)
+            assert batch_size != 0
+            if mu.data.ndimension() == 4:
+                mu = mu.view(mu.size(0), mu.size(1))
+            if logvar.data.ndimension() == 4:
+                logvar = logvar.view(logvar.size(0), logvar.size(1))
+
+            klds = -0.5*(1 + logvar - mu.pow(2) - logvar.exp())
+            total_kld = klds.sum(1).mean(0, True)
+            dimension_wise_kld = klds.mean(0)
+            mean_kld = klds.mean(1).mean(0, True)
+
+            return total_kld, dimension_wise_kld, mean_kld
+            """
             mu, logvar = output.latent_mean, output.latent_logvar
+            # Closed-form KL(N(mu, diag(exp(logvar))) || N(0, I)) in nats:
+            # Kingma & Welling (ICLR 2014) matches ControlVAE (Shao et al., ICML 2020, solver_light.py).
             kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+            # dim=0: samples, dim=1: latent dimensions. Example with 2 samples x 3 latent dims:
+            #   kl = [[1.0, 2.0, 3.0],   # sample 0 -> sum(dim=1) = 6.0
+            #         [0.5, 1.5, 2.0]]   # sample 1 -> sum(dim=1) = 4.0
+            #   kl.sum(dim=1).mean()     = (6.0 + 4.0) / 2 = 5.0           (scalar for ControlVAE PI)
+            #   kl.sum(dim=0)            = [1.5, 3.5, 5.0]                 (per-dim sum for epoch mean: /2 -> [0.75, 1.75, 2.5], sum = 5.0)
             batch_sum = kl.sum(dim=0, dtype=torch.float64)
             kl_sum = batch_sum if kl_sum is None else kl_sum + batch_sum
             sample_count += kl.shape[0]
-            if self.signal == "total":
-                # ControlVAE sums latent axes, then averages over samples directly from the training batch.
-                measured_kl = kl.sum(dim=1).mean().item()
-            else:
-                measured_kl = kl.mean(dim=0).max().item()
-            self.beta_scheduler.step(measured_kl, epoch)
+            # ControlVAE sums latent axes, then averages over samples directly from the training batch.
+            measured_kl_per_batch = kl.sum(dim=1).mean().item()
+            self.beta_scheduler.step(measured_kl_per_batch, epoch)
             batch_betas.append(self.beta_scheduler.beta_scale * self.beta_scheduler.get_weight(epoch_current=epoch))
 
-        hook = self._model.register_forward_hook(feed_guard)
+        # Use a forward hook so feed_guard runs after each batch forward pass and updates beta
+        hook = self._model.register_forward_hook(feed_guard_while_train)
         try:
             losses = super()._train_epoch(should_checkpoint=should_checkpoint, epoch=epoch)
         finally:
@@ -212,7 +289,7 @@ class GuardedTrainer(GeneralTrainer):
             "max_R": max_rate,
             "total_KL": total_rate,
             "controlled_dim": strongest,
-            "n_alive": sum(rate > self.collapse_threshold for rate in training_rates),
+            "n_alive": sum(rate > self.lucas_epsilon for rate in training_rates),
             "R_train_nats": total_rate,
             "integral": self.beta_scheduler.integral,
             "train_R_j_nats": training_rates,
@@ -222,6 +299,89 @@ class GuardedTrainer(GeneralTrainer):
             "beta_batch_min": min(batch_betas),
             "beta_batch_max": max(batch_betas),
         })
+        return losses
+
+    def _validate_epoch(self, should_checkpoint, epoch):
+        """Measure Lucas collapse from the existing validation forward passes."""
+        means, logvars = [], []
+
+        def capture_posteriors(_model, _inputs, output):
+            means.append(output.latent_mean.detach().cpu())
+            logvars.append(output.latent_logvar.detach().cpu())
+
+        hook = self._model.register_forward_hook(capture_posteriors)
+        try:
+            losses = super()._validate_epoch(should_checkpoint=should_checkpoint, epoch=epoch)
+        finally:
+            hook.remove()
+        if not means:
+            raise RuntimeError("The validation forward hook recorded no posteriors")
+
+        """
+        x = torch.randn(2, 3)
+        x
+        tensor([[ 0.6580, -1.0969, -0.4614],
+                [-0.1034, -0.5790,  0.1497]])
+        torch.cat((x, x, x), 0)
+        tensor([[ 0.6580, -1.0969, -0.4614],
+                [-0.1034, -0.5790,  0.1497],
+                [ 0.6580, -1.0969, -0.4614],
+                [-0.1034, -0.5790,  0.1497],
+                [ 0.6580, -1.0969, -0.4614],
+                [-0.1034, -0.5790,  0.1497]])
+        torch.cat((x, x, x), 1)
+        tensor([[ 0.6580, -1.0969, -0.4614,  0.6580, -1.0969, -0.4614,  0.6580,
+                -1.0969, -0.4614],
+                [-0.1034, -0.5790,  0.1497, -0.1034, -0.5790,  0.1497, -0.1034,
+                -0.5790,  0.1497]])
+        """
+        mu = torch.cat(means).double()
+        kl_samples = kl_per_sample(mu, torch.cat(logvars))
+        result = lucas_collapse(kl_samples, epsilon=self.lucas_epsilon, delta=self.lucas_delta)
+        self._lucas_zero_streak = (
+            getattr(self, "_lucas_zero_streak", 0) + 1
+            if result["n_noncollapsed_dimensions"] == 0 else 0
+        )
+        previous = getattr(self, "_last_lucas", None) or {}
+        self._last_lucas = {
+            **result,
+            "full_collapse_streak": self._lucas_zero_streak,
+            "full_collapse_confirmed": self._lucas_zero_streak >= self.lucas_confirm_epochs,
+        }
+        sample_count, dimension_count = kl_samples.shape
+        rates = kl_samples.mean(dim=0).tolist()
+        previous_streaks = previous.get("lucas_dimension_streaks", [0] * dimension_count)
+        collapsed = set(result["collapsed_dimensions"])
+        dimension_streaks = [count + 1 if axis in collapsed else 0
+                             for axis, count in enumerate(previous_streaks)]
+        self._last_lucas.update(lucas_dimension_streaks=dimension_streaks)
+        quantiles = {
+            f"q{round(100 * q)}": kl_samples.kthvalue(math.ceil(q * sample_count), dim=0).values.tolist()
+            for q in (0.50, 0.90, 0.95, 0.99)
+        }
+        lucas_q99 = lucas_quantile(kl_samples, delta=self.lucas_delta)
+        active_shares = [1.0 - fraction for fraction in result["fractions_below_epsilon"]]
+        self._validation_record = {
+            "split": "valid",
+            "samples": sample_count,
+            "R_j_nats": rates,
+            "v_j": (0.5 * mu.var(dim=0, correction=int(sample_count > 1))).tolist(),
+            "threshold_nats": self.lucas_epsilon,
+            "collapsed_dimensions": [axis for axis, rate in enumerate(rates) if rate < self.lucas_epsilon],
+            "lucas": self._last_lucas,
+            "lucas_dimension_streaks": dimension_streaks,
+            "lucas_full_collapse_streak": self._lucas_zero_streak,
+            "lucas_full_collapse_confirmed": self._last_lucas["full_collapse_confirmed"],
+            "lucas_q99_nats": lucas_q99,
+            "lucas_q99_max": max(lucas_q99),
+            "kl_quantiles_nats": quantiles,
+            "lucas_share_active": active_shares,
+            "lucas_share_active_max": max(active_shares),
+            "max_R": max(rates),
+            "total_KL": sum(rates),
+            "valid_loss": float(losses[0]),
+            "recon_loss": float(losses[1]["recon_loss"]),
+        }
         return losses
 
     def _eval_collapse(self, dataset=None):
@@ -407,7 +567,15 @@ class GuardedTrainer(GeneralTrainer):
         elif self.phase == "control":
             if collapsed:
                 if self.restarts >= self.max_restarts:
-                    self.phase, self.fail_reason = "failed", "max_restarts"
+                    fallback = (
+                        self._anneal_ring[-1]
+                        if self._anneal_ring
+                        else min(self._level_states.values(), key=lambda s: s["epoch"])
+                    )
+                    self.load_checkpoint(fallback["path"])
+                    self._current_level = fallback["epoch"]
+                    self.beta_handover = fallback["applied_factor"]
+                    self.phase, self.fail_reason = "done", "max_restarts_fallback"
                 else:
                     chosen = self._select_ring_checkpoint()
                     if chosen is not None:
@@ -510,78 +678,11 @@ class GuardedTrainer(GeneralTrainer):
         }
 
     def _restart_from(self, level, state):
-        """Reload the level checkpoint and hand over there with the snapshot's setpoint."""
         next_epoch = self.load_checkpoint(state["path"])
         self._start_control(next_epoch - 1, level, state)
         return next_epoch
 
-    def _validate_epoch(self, should_checkpoint, epoch):
-        """Measure Lucas collapse from the existing validation forward passes."""
-        means, logvars = [], []
-
-        def capture_posteriors(_model, _inputs, output):
-            means.append(output.latent_mean.detach().cpu())
-            logvars.append(output.latent_logvar.detach().cpu())
-
-        hook = self._model.register_forward_hook(capture_posteriors)
-        try:
-            losses = super()._validate_epoch(should_checkpoint=should_checkpoint, epoch=epoch)
-        finally:
-            hook.remove()
-        if not means:
-            raise RuntimeError("The validation forward hook recorded no posteriors")
-
-        mu = torch.cat(means).double()
-        kl_samples = kl_per_sample(mu, torch.cat(logvars))
-        result = lucas_collapse(kl_samples, epsilon=self.lucas_epsilon, delta=self.lucas_delta)
-        self._lucas_zero_streak = (
-            getattr(self, "_lucas_zero_streak", 0) + 1
-            if result["n_noncollapsed_dimensions"] == 0 else 0
-        )
-        previous = getattr(self, "_last_lucas", None) or {}
-        self._last_lucas = {
-            **result,
-            "full_collapse_streak": self._lucas_zero_streak,
-            "full_collapse_confirmed": self._lucas_zero_streak >= self.lucas_confirm_epochs,
-        }
-        sample_count, dimension_count = kl_samples.shape
-        rates = kl_samples.mean(dim=0).tolist()
-        previous_streaks = previous.get("lucas_dimension_streaks", [0] * dimension_count)
-        collapsed = set(result["collapsed_dimensions"])
-        dimension_streaks = [count + 1 if axis in collapsed else 0
-                             for axis, count in enumerate(previous_streaks)]
-        self._last_lucas.update(lucas_dimension_streaks=dimension_streaks)
-        quantiles = {
-            f"q{round(100 * q)}": kl_samples.kthvalue(math.ceil(q * sample_count), dim=0).values.tolist()
-            for q in (0.50, 0.90, 0.95, 0.99)
-        }
-        lucas_q99 = lucas_quantile(kl_samples, delta=self.lucas_delta)
-        active_shares = [1.0 - fraction for fraction in result["fractions_below_epsilon"]]
-        self._validation_record = {
-            "split": "valid",
-            "samples": sample_count,
-            "R_j_nats": rates,
-            "v_j": (0.5 * mu.var(dim=0, correction=int(sample_count > 1))).tolist(),
-            "threshold_nats": self.collapse_threshold,
-            "collapsed_dimensions": [axis for axis, rate in enumerate(rates) if rate < self.collapse_threshold],
-            "lucas": self._last_lucas,
-            "lucas_dimension_streaks": dimension_streaks,
-            "lucas_full_collapse_streak": self._lucas_zero_streak,
-            "lucas_full_collapse_confirmed": self._last_lucas["full_collapse_confirmed"],
-            "lucas_q99_nats": lucas_q99,
-            "lucas_q99_max": max(lucas_q99),
-            "kl_quantiles_nats": quantiles,
-            "lucas_share_active": active_shares,
-            "lucas_share_active_max": max(active_shares),
-            "max_R": max(rates),
-            "total_KL": sum(rates),
-            "valid_loss": float(losses[0]),
-            "recon_loss": float(losses[1]["recon_loss"]),
-        }
-        return losses
-
     def _record_epoch(self, epoch, train_parts):
-        """Record the training signal and the independent validation diagnostics."""
         observation = self._training_history[-1]
         record = {
             **observation,
@@ -602,7 +703,6 @@ class GuardedTrainer(GeneralTrainer):
         return record
 
     def _export_posteriors(self, epoch, beta, *, event="checkpoint", attempt=0):
-        """Export the posteriors and reconstruction scores used by the analyses."""
         path = Path("posteriors") / f"epoch{epoch + 1}_{event}_attempt{attempt}.npz"
         (self.collapse_output / path).parent.mkdir(parents=True, exist_ok=True)
         arrays, scores = {}, {}
@@ -648,57 +748,7 @@ class GuardedTrainer(GeneralTrainer):
         with (self.collapse_output / "posterior_index.jsonl").open("a") as stream:
             stream.write(json.dumps(entry) + "\n")
 
-    def _write_summary(self, history_path):
-        """Summarize the epochs written by this run."""
-        first_confirmation = None
-        epochs_recorded = 0
-        last = None
-        with history_path.open() as stream:
-            for line in stream:
-                last = json.loads(line)
-                epochs_recorded += 1
-                if first_confirmation is None and last.get("lucas_full_collapse_confirmed"):
-                    first_confirmation = last["epoch_number"]
-        summary = {
-            "status": ("early_stopped" if self.stop_epoch is not None else
-                       "failed" if self.lucas_handover and self.phase == "failed" else
-                       "collapse_despite_guard" if first_confirmation is not None and self.beta_scheduler.beta is not None else
-                       "held" if self.beta_scheduler.beta is not None else
-                       "no_trigger"),
-            "form": self.handover_mode,
-            "signal": self.signal,
-            "guard_enabled": self.guard_enabled,
-            "stop_on_done": self.handover_mode == "early_stop",
-            "epochs_run": len(self._training_history),
-            "epochs_recorded": epochs_recorded,
-            "total_epochs": self.beta_scheduler.total_epochs,
-            "trigger_epoch": self.handover_epoch,
-            "stop_epoch": self.stop_epoch,
-            "target_kl": self.target_kl,
-            "collapse_value": self.collapse_threshold,
-            "config_beta": float(self._config.beta),
-            "schedule": self.beta_scheduler.schedule,
-            "beta_trigger": (last["effective_beta"] if self.stop_epoch is not None else
-                             self.beta_scheduler.beta_trigger),
-            "beta_hold": last["effective_beta"] if last and self.handover_epoch is not None else None,
-            "kp": self.beta_scheduler.kp,
-            "ki": self.beta_scheduler.ki,
-            "ki_step": self.beta_scheduler.ki_step,
-            "gains_per": self.beta_scheduler.gains_per,
-            "beta_max_rule": self.beta_scheduler.beta_max,
-            "anti_windup": self.beta_scheduler.anti_windup,
-            "feedback_source": "training_batch_mean_KL",
-            "lucas": last.get("lucas") if last else None,
-            "first_full_collapse_confirmation": first_confirmation,
-        }
-        if self.lucas_handover:
-            summary["lucas_handover"] = self._lucas_handover_summary(epochs_recorded)
-        if self.lucas_observe:
-            summary["lucas_observe"] = self._lucas_observe_summary()
-        (self.collapse_output / "guard_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-
     def _hand_over(self, epoch, factor, measured_kl):
-        """Apply the selected action to the current training state."""
         self.handover_epoch = epoch
         if not self.guard_enabled:
             return
@@ -709,70 +759,6 @@ class GuardedTrainer(GeneralTrainer):
                 self.handover_mode, self.beta_scheduler.beta_scale * factor,
                 target_kl=self.target_kl, measured_kl=measured_kl,
             )
-
-    def train(self, epochs_overwrite=None, *, export_posteriors=False):
-        """Train from scratch with annealing, Lucas full-collapse rollback, and PI hold."""
-        epochs = epochs_overwrite or self._config.epochs
-        if epochs < 1:
-            raise ValueError("The training budget must be positive")
-        history_path = self.collapse_output / "collapse_history.jsonl"
-        if history_path.exists():
-            raise FileExistsError(f"Choose a separate output directory for this run: {history_path}")
-
-        self.collapse_output.mkdir(parents=True, exist_ok=True)
-        with self._fabric.autocast():
-            epoch = 0
-            while epoch < epochs or (self.lucas_handover and self.phase == "control"):
-                self._init_buffers()
-                should_checkpoint = self._should_checkpoint(epoch)
-                self._model.train()
-                train_loss, train_parts = self._train_epoch(should_checkpoint, epoch)
-                self._log_losses(epoch, "train", train_loss, train_parts)
-                if self._validset:
-                    valid_loss, valid_parts = self._validate_epoch(should_checkpoint, epoch)
-                    self._log_losses(epoch, "valid", valid_loss, valid_parts)
-                if should_checkpoint:
-                    self._store_checkpoint(epoch)
-                restart = self._lucas_epoch_end(epoch) if self.lucas_handover else None
-                if self.lucas_observe:
-                    self._lucas_observe_epoch_end(epoch)
-                record = self._record_epoch(epoch, train_parts)
-                if export_posteriors:
-                    if record.get("lookback_handover"):
-                        event = "annealing_collapse"
-                    elif self.lucas_handover and record["state"] == "hold" and record["lucas_full_collapse_train_eval"]:
-                        event = "pi_collapse"
-                    elif self.lucas_handover and self.phase in ("done", "failed"):
-                        event = self.phase
-                    elif epoch == epochs - 1 or self.stop_epoch == epoch:
-                        event = "checkpoint"
-                    else:
-                        event = None
-                    if event:
-                        self._export_posteriors(epoch, record["beta_batch_last"],
-                                                event=event, attempt=record.get("attempt", 0))
-                if self.on_epoch is not None:
-                    self.on_epoch(self, epoch, record)
-                if self.stop_epoch == epoch or (
-                    (self.lucas_handover or self.lucas_observe) and self.phase in ("done", "failed")
-                ):
-                    self._finish_early(epoch, already_stored=should_checkpoint)
-                    break
-                if restart:
-                    epoch = self._restart_from(*restart)
-                    if export_posteriors:
-                        self._export_posteriors(epoch - 1, self.beta_handover * self.beta_scheduler.beta_scale,
-                                                event="handover", attempt=self.restarts)
-                else:
-                    epoch += 1
-        if self.lucas_handover:
-            if self.phase == "annealing":
-                self.fail_reason = ("no_handover_within_budget" if self.first_active_epoch_number is not None
-                                    else "never_active_within_training_budget")
-            self._cleanup_level_checkpoints()
-        self._write_summary(history_path)
-        self._result.model = next(self._model.children())
-        return self._result
 
     def _finish_early(self, epoch, *, already_stored):
         """Save the last epoch where AUTOENCODIX expects the final result."""
@@ -807,7 +793,7 @@ class GuardedTrainer(GeneralTrainer):
             "handover": {
                 "enabled": self.guard_enabled,
                 "mode": self.handover_mode,
-                "signal": self.signal,
+                "signal": "total",
                 "target_kl": self.target_kl,
                 "handover_epoch": self.handover_epoch,
                 "stop_epoch": self.stop_epoch,
@@ -835,7 +821,6 @@ class GuardedTrainer(GeneralTrainer):
             temporary.unlink(missing_ok=True)
 
     def load_checkpoint(self, path):
-        """Restore a trusted v2 checkpoint into a trainer with the same configuration."""
         state = torch.load(path, map_location="cpu", weights_only=False)
         if state["format_version"] != 2:
             raise ValueError("Unsupported checkpoint format (expected version 2)")
@@ -855,7 +840,7 @@ class GuardedTrainer(GeneralTrainer):
         self.beta_scheduler = scheduler
         self._loss_fn.annealing_scheduler = scheduler
         self._training_history = state["training_history"]
-        self.guard_enabled, self.handover_mode, self.signal = handover["enabled"], handover["mode"], handover["signal"]
+        self.guard_enabled, self.handover_mode = handover["enabled"], handover["mode"]
         self.target_kl = handover["target_kl"]
         self.handover_epoch, self.stop_epoch = handover["handover_epoch"], handover["stop_epoch"]
         self._last_lucas = state.get("last_lucas")
@@ -869,3 +854,50 @@ class GuardedTrainer(GeneralTrainer):
         if rng["cuda"]:
             torch.cuda.set_rng_state_all(rng["cuda"])
         return state["next_epoch"]
+
+    def _write_summary(self, history_path):
+        first_confirmation = None
+        epochs_recorded = 0
+        last = None
+        with history_path.open() as stream:
+            for line in stream:
+                last = json.loads(line)
+                epochs_recorded += 1
+                if first_confirmation is None and last.get("lucas_full_collapse_confirmed"):
+                    first_confirmation = last["epoch_number"]
+        summary = {
+            "status": ("early_stopped" if self.stop_epoch is not None else
+                       "failed" if self.lucas_handover and self.phase == "failed" else
+                       "collapse_despite_guard" if first_confirmation is not None and self.beta_scheduler.beta is not None else
+                       "held" if self.beta_scheduler.beta is not None else
+                       "no_trigger"),
+            "form": self.handover_mode,
+            "signal": "total",
+            "guard_enabled": self.guard_enabled,
+            "stop_on_done": self.handover_mode == "early_stop",
+            "epochs_run": len(self._training_history),
+            "epochs_recorded": epochs_recorded,
+            "total_epochs": self.beta_scheduler.total_epochs,
+            "trigger_epoch": self.handover_epoch,
+            "stop_epoch": self.stop_epoch,
+            "target_kl": self.target_kl,
+            "config_beta": float(self._config.beta),
+            "schedule": self.beta_scheduler.schedule,
+            "beta_trigger": (last["effective_beta"] if self.stop_epoch is not None else
+                             self.beta_scheduler.beta_trigger),
+            "beta_hold": last["effective_beta"] if last and self.handover_epoch is not None else None,
+            "kp": self.beta_scheduler.kp,
+            "ki": self.beta_scheduler.ki,
+            "ki_step": self.beta_scheduler.ki_step,
+            "gains_per": self.beta_scheduler.gains_per,
+            "beta_max_rule": self.beta_scheduler.beta_max,
+            "anti_windup": self.beta_scheduler.anti_windup,
+            "feedback_source": "training_batch_mean_KL",
+            "lucas": last.get("lucas") if last else None,
+            "first_full_collapse_confirmation": first_confirmation,
+        }
+        if self.lucas_handover:
+            summary["lucas_handover"] = self._lucas_handover_summary(epochs_recorded)
+        if self.lucas_observe:
+            summary["lucas_observe"] = self._lucas_observe_summary()
+        (self.collapse_output / "guard_summary.json").write_text(json.dumps(summary, indent=2) + "\n")

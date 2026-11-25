@@ -1,4 +1,4 @@
-"""Supply the current beta factor to the native Varix loss."""
+"""Supply the current beta factor to the Varix loss."""
 
 import math
 
@@ -35,17 +35,16 @@ class BetaScheduler:
         self.integral = self.previous_output = None
 
     def get_weight(self, *, epoch_current=None, total_epoch=None, func=None, scheduled=False):
-        """Return the factor Varix multiplies by its configured beta."""
         if epoch_current is None:
             return 1.0
         if self.beta is not None and not scheduled:
+            #Autoencodix Varixloss: return self.beta / self.beta_scale if self.beta_scale else 0.0
             return self.beta / self.beta_scale if self.beta_scale else 0.0
         return self.annealing.get_weight(
             epoch_current=epoch_current, total_epoch=self.total_epochs, func=self.schedule,
         )
 
     def start(self, mode, beta, *, measured_kl=None, target_kl=None):
-        """Freeze beta or initialize PI at the current beta."""
         if mode not in ("freeze", "controlvae"):
             raise ValueError("mode must be 'freeze' or 'controlvae'")
         if mode == "controlvae":
@@ -62,18 +61,18 @@ class BetaScheduler:
         self.mode, self.beta, self.beta_trigger = mode, beta, beta
 
     def step(self, measured_kl, epoch):
-        """Update beta from the current training batch when PI is active."""
         if self.mode != "controlvae" or not self.beta_scale:
+            #do nothing
             return
         if self.beta_max == "schedule":
-            cap = self.beta_scale * self.get_weight(epoch_current=epoch, scheduled=True)
+            upper_bound = self.beta_scale * self.get_weight(epoch_current=epoch, scheduled=True)
         elif self.beta_max == "trigger":
-            cap = self.beta_trigger
+            upper_bound = self.beta_trigger
         else:
-            cap = self.beta_max
+            upper_bound = self.beta_max
         result = controlvae_step(
             self.target_kl - measured_kl, kp=self.kp, ki=self.ki_step,
             integral=self.integral, previous_output=self.previous_output,
-            beta_min=self.beta_min, beta_max=max(self.beta_min, cap), anti_windup=self.anti_windup,
+            beta_min=self.beta_min, beta_max=max(self.beta_min, upper_bound), anti_windup=self.anti_windup,
         )
         self.beta, self.integral, self.previous_output = result.beta, result.integral, result.unclamped

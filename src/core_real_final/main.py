@@ -48,7 +48,6 @@ def main():
     parser.add_argument("--group")
     parser.add_argument("--topology", choices=("circle", "sphere"))
     parser.add_argument("--mode", choices=("early_stop", "freeze", "controlvae"))
-    parser.add_argument("--signal", choices=("total", "max"))
     parser.add_argument("--split-seed", type=int)
     parser.add_argument("--train-seed", type=int)
     parser.add_argument("--run-name")
@@ -154,14 +153,9 @@ def main():
         parser.error("--observe-until-end requires --observe-collapse")
 
     mode = args.mode or guard.get("form", "controlvae")
-    signal = args.signal or ("total" if lucas_enabled or args.observe_collapse else guard.get("signal", "total"))
     if mode not in ("early_stop", "freeze", "controlvae"):
         parser.error("Set guard.form or --mode to early_stop, freeze or controlvae")
-    if signal not in ("total", "max"):
-        parser.error("Set guard.signal or --signal to total or max for training KL feedback")
-    if lucas_enabled and signal != "total":
-        parser.error("--lucas-handover requires --signal total")
-    guard.update(form=mode, signal=signal)
+    guard["form"] = mode
 
     if dataset == "tcga":
         group = args.group or (experiment.get("groups") or ["all_classes"])[0]
@@ -263,7 +257,7 @@ def main():
     trainer = GuardedTrainer(
         trainset=datasets.train, validset=datasets.valid, result=pipeline.result,
         config=config, model_type=VarixArchitecture, loss_type=VarixLoss,
-        collapse_output=output, collapse_threshold=float(guard.get("collapse_value", 0.01)),
+        collapse_output=output,
         guard_enabled=guard.get("enabled", True), guard_options=guard,
         lucas_epsilon=(args.collapse_epsilon if args.collapse_epsilon is not None
                        else float(collapse.get("lucas_epsilon_nats", 0.01))),
@@ -274,7 +268,7 @@ def main():
         lucas_observe=args.observe_collapse,
         observe_until_end=args.observe_until_end,
         monitor_epsilons=monitor_epsilons,
-        on_epoch=print_lucas if args.print_lucas else None,
+        print_lucas_callback=print_lucas if args.print_lucas else None,
         handover_checkpoint_dir=output / "handover_levels",
         **lucas,
     )

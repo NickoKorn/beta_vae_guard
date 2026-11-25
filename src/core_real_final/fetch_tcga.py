@@ -17,7 +17,6 @@ ZENODO_ARCHIVE = (
 
 
 def fetch_tcga(folder, source):
-    """Download and verify missing files without replacing existing data."""
     folder = Path(folder).expanduser()
     members = source["members"]
     missing = []
@@ -36,13 +35,13 @@ def fetch_tcga(folder, source):
         temporary = Path(temporary)
         archive = temporary / "tcga.zip"
         url = source.get("url", ZENODO_ARCHIVE)
-        print(f"Downloading TCGA archive from {url}", flush=True)
+        print(f"Downloading TCGA from {url}", flush=True)
         urlretrieve(url, archive)
         with zipfile.ZipFile(archive) as data:
             for member in missing:
                 name = member["name"]
                 if Path(name).name != name:
-                    raise ValueError(f"Expected a plain TCGA filename: {name}")
+                    raise ValueError(f"Expected a TCGA filename: {name}")
                 extracted = temporary / name
                 with data.open(name) as source_file, extracted.open("wb") as output:
                     shutil.copyfileobj(source_file, output)
@@ -51,6 +50,5 @@ def fetch_tcga(folder, source):
                 try:
                     os.link(extracted, folder / name)
                 except FileExistsError:
-                    # Another process completed the same download concurrently.
-                    pass
+                    print(f"Something happened: {FileExistsError}")
     return tcga_files(folder, members)

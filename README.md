@@ -33,20 +33,3 @@ TCGA-Baselines (`freeze`, `early_stop`, `controlvae`) + GUDHI-Suite:
 ```bash
 .venv/bin/python -m src.core_real_final.run_5090_experiments /pfad/zum/output --suite all --workers 2
 ```
-
-## Starten (Windows / PowerShell)
-
-Aus dem Repo-Hauptordner (richtet `.venv-windows` mit PyTorch CUDA 12.8 automatisch ein):
-```powershell
-# Baselines + GUDHI (eps = 0.1):
-powershell -ExecutionPolicy Bypass -File .\windows\run_5090_experiments.ps1
-
-# Paralleles TCGA-Raster (4 Worker, eps = 0.01):
-powershell -ExecutionPolicy Bypass -File .\windows\run_windows_parallel4.ps1
-```
-
-## Tests
-
-```bash
-PYTHONPATH=. .venv/bin/pytest -q tests/test_activation_window.py
-```

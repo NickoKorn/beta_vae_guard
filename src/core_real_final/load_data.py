@@ -4,6 +4,7 @@ import contextlib
 import os
 from pathlib import Path
 
+import pandas as pd
 
 def select_samples(annotation, group, tcga_config):
     """Select configured TCGA sample IDs while preserving annotation order."""
@@ -48,9 +49,6 @@ def tcga_files(folder, members):
 
 
 def tcga(group, folder, tcga_config):
-    """Load and align configured TCGA modalities and annotations for one group."""
-    import pandas as pd
-
     members = tcga_config["source"]["members"]
     paths = tcga_files(folder, members)
     rna = pd.read_parquet(paths["RNA"])
