@@ -1,13 +1,3 @@
-"""Quality of the latent space of a trained pipeline (analysis only, no training).
-
-    latent_metrics(pipeline, mu)       AUTOENCODIX-native total correlation and coverage
-    measure_preservation(original, z)  ZADU: LCMC (local), Spearman (global), steadiness/cohesiveness
-    diagrams(points, dims, n)          GUDHI persistent homology H0/H1/H2 (synthetic point clouds)
-    n_long_bars(bars)                  estimated Betti number from persistence bars
-    evaluate_pipeline(pipeline, out)   test-split report: KL per dimension, TC, coverage,
-                                       preservation, downstream (AUTOENCODIX evaluate), native plots
-    python -m src.analysis.latent PIPELINE [--output DIR]
-"""
 import argparse
 import json
 from pathlib import Path
@@ -17,35 +7,20 @@ import numpy as np
 from src.core_real_final.guarded_trainer import kl_per_sample, lucas_collapse
 
 def reconstruction_r2(x, recon):
-    """Reconstruction R^2 of a samples-by-features matrix, three conventions.
-
-    r2_sample    AUTOENCODIX (reproducibility repo, src/utils/utils.py):
-                 torcheval r2_score(recon.T, x.T, multioutput="uniform_average"), i.e. R^2 of each
-                 sample's profile over the features, averaged over samples
-    r2_feature   classic R^2 per feature over the samples (sklearn r2_score, uniform average);
-                 features without variance in this split are left out
-    r2_weighted  1 - sum SSE / sum SST over all features (sklearn "variance_weighted")
-    """
     x, recon = np.asarray(x, dtype=np.float64), np.asarray(recon, dtype=np.float64)
     if x.shape != recon.shape or x.ndim != 2:
         raise ValueError("x and recon must be matching samples-by-features matrices")
-    sse = (x - recon) ** 2
-    sst_sample = ((x - x.mean(1, keepdims=True)) ** 2).sum(1)
-    sst_feature = ((x - x.mean(0)) ** 2).sum(0)
-    ok_s, ok_f = sst_sample > 0, sst_feature > 0
-    return dict(r2_sample=float(np.mean(1 - sse.sum(1)[ok_s] / sst_sample[ok_s])),
-                r2_feature=float(np.mean(1 - sse.sum(0)[ok_f] / sst_feature[ok_f])),
-                r2_weighted=float(1 - sse.sum() / sst_feature.sum()))
+    sum_squared_error = (x - recon) ** 2
+    total_sum_of_squares_per_sample = ((x - x.mean(1, keepdims=True)) ** 2).sum(1)
+    total_sum_of_squares_per_feature = ((x - x.mean(0)) ** 2).sum(0)
+    ok_s, ok_f = total_sum_of_squares_per_sample > 0, total_sum_of_squares_per_feature > 0
+    return dict(r2_sample=float(np.mean(1 - sum_squared_error.sum(1)[ok_s] / total_sum_of_squares_per_sample[ok_s])),
+                r2_feature=float(np.mean(1 - sum_squared_error.sum(0)[ok_f] / total_sum_of_squares_per_feature[ok_f])),
+                r2_weighted=float(1 - sum_squared_error.sum() / total_sum_of_squares_per_feature.sum()))
 
 
 def pca_baseline(data, k):
-    """PCA with k components as the linear reference, evaluated like AUTOENCODIX.
 
-    data: load_data.preprocessed(group, split). As AUTOENCODIX (evaluate/_general_evaluator.py,
-    reference_methods "PCA"): the PCA is fitted on train + valid + test concatenated, the classifier is
-    LogisticRegression(max_iter=1000) fitted on train, scored with roc_auc_ovo on valid. Also the
-    reconstruction R^2 of valid (inverse_transform) and the explained variance.
-    """
     from sklearn.decomposition import PCA
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import get_scorer
@@ -206,12 +181,6 @@ def evaluate_pipeline(pipeline, output, target="CANCER_TYPE_ACRONYM"):
 
 def quality_over_time(branch, original, sample_ids, *, ks=(5, 20), epsilon=0.01, delta=0.01):
     """TC, coverage and ZADU preservation of the validation posterior means at every exported epoch.
-
-    branch: folder of one continuation (posterior_index.jsonl + posteriors/*.npz, as written by
-    src/experiments/last_axis_monitor.py); original: preprocessed validation inputs (samples x
-    features) in the order of sample_ids. TC and coverage are AUTOENCODIX's formulas
-    (doi:10.3390/e21100921, Eq. 2/3), computed on all dimensions and on the Lucas-active ones only:
-    collapsed dimensions have a near-constant mean, which makes TC degenerate. Returns a DataFrame.
     """
     import pandas as pd
     import torch
